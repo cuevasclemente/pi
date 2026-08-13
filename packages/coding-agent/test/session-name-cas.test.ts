@@ -1,19 +1,25 @@
+import type * as FsModule from "node:fs";
 import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	linkSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
+	unlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +30,64 @@ import {
 	SessionManager,
 	type SessionNameState,
 } from "../src/core/session-manager.ts";
+
+const scanProbe = vi.hoisted(() => ({
+	lockHeld: false,
+	readsWhileLocked: 0,
+	materializeUnlinkFailures: 0,
+	materializeConcurrentAppendLine: undefined as string | undefined,
+	directoryFsyncErrorCode: undefined as string | undefined,
+	revisionRaceFile: undefined as string | undefined,
+	revisionRaceLine: undefined as string | undefined,
+	revisionRaceReads: 0,
+}));
+vi.mock("fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof FsModule>();
+	return {
+		...actual,
+		readSync(
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: number | null,
+		): number {
+			if (scanProbe.lockHeld) scanProbe.readsWhileLocked++;
+			if (scanProbe.revisionRaceFile && scanProbe.revisionRaceLine && scanProbe.revisionRaceReads > 0) {
+				scanProbe.revisionRaceReads--;
+				if (scanProbe.revisionRaceReads === 0) {
+					actual.appendFileSync(scanProbe.revisionRaceFile, scanProbe.revisionRaceLine);
+					scanProbe.revisionRaceFile = undefined;
+					scanProbe.revisionRaceLine = undefined;
+				}
+			}
+			return actual.readSync(fd, buffer, offset, length, position);
+		},
+		unlinkSync(path: Parameters<typeof actual.unlinkSync>[0]): void {
+			const pathText = String(path);
+			if (pathText.includes(".materialize-") && scanProbe.materializeUnlinkFailures > 0) {
+				scanProbe.materializeUnlinkFailures--;
+				if (scanProbe.materializeConcurrentAppendLine) {
+					actual.appendFileSync(
+						pathText.slice(0, pathText.indexOf(".materialize-")),
+						scanProbe.materializeConcurrentAppendLine,
+					);
+					scanProbe.materializeConcurrentAppendLine = undefined;
+				}
+				throw Object.assign(new Error("injected materialize unlink failure"), { code: "EIO" });
+			}
+			actual.unlinkSync(path);
+		},
+		fsyncSync(fd: number): void {
+			if (scanProbe.directoryFsyncErrorCode && actual.fstatSync(fd).isDirectory()) {
+				throw Object.assign(new Error("injected directory fsync failure"), {
+					code: scanProbe.directoryFsyncErrorCode,
+				});
+			}
+			actual.fsyncSync(fd);
+		},
+	};
+});
 
 const tempDirs: string[] = [];
 const timestamp = "2026-08-12T00:00:00.000Z";
@@ -65,39 +129,79 @@ function initialNameState(): SessionNameState {
 }
 
 afterEach(() => {
+	scanProbe.lockHeld = false;
+	scanProbe.readsWhileLocked = 0;
+	scanProbe.materializeUnlinkFailures = 0;
+	scanProbe.materializeConcurrentAppendLine = undefined;
+	scanProbe.directoryFsyncErrorCode = undefined;
+	scanProbe.revisionRaceFile = undefined;
+	scanProbe.revisionRaceLine = undefined;
+	scanProbe.revisionRaceReads = 0;
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
 describe("SessionManager session name transactions", () => {
-	it("reloads under the shared lock before a legacy whole-file migration rewrite", () => {
+	it("retries a revision-raced migration without losing a concurrent append", () => {
 		const file = createSessionFile();
 		const legacyHeader = JSON.parse(readFileSync(file, "utf8").trim()) as Record<string, unknown>;
 		legacyHeader.version = 2;
 		writeFileSync(file, `${JSON.stringify(legacyHeader)}\n`);
-		const humanEntry = {
-			type: "session_info",
-			id: "human-during-migration",
-			parentId: null,
-			timestamp,
-			name: "Human during migration",
-			origin: "human",
-		};
+		const concurrentEntry = messageEntry("concurrent-message", null, "concurrent append");
 		const originalLockSync = lockfile.lockSync.bind(lockfile);
-		const lockSpy = vi.spyOn(lockfile, "lockSync").mockImplementationOnce(((target: string, options: object) => {
-			// Simulate a cooperating writer committing after the migration manager's
-			// initial stale read but before it owns the shared physical-file lock.
-			appendFileSync(file, `${JSON.stringify(humanEntry)}\n`);
-			return originalLockSync(target, options as any);
+		const lockSpy = vi.spyOn(lockfile, "lockSync").mockImplementationOnce(((
+			target: string,
+			options: Parameters<typeof lockfile.lockSync>[1],
+		) => {
+			// Simulate a cooperating writer committing after the outside-lock scan
+			// but before the migration's revision-validated commit.
+			const releaseConcurrentWriter = originalLockSync(target, options);
+			try {
+				appendFileSync(file, `${JSON.stringify(concurrentEntry)}\n`);
+			} finally {
+				releaseConcurrentWriter();
+			}
+			return originalLockSync(target, options);
 		}) as typeof lockfile.lockSync);
 		try {
 			const manager = SessionManager.open(file);
-			expect(manager.getSessionName()).toBe("Human during migration");
 			const entries = parseSessionEntries(readFileSync(file, "utf8"));
 			expect((entries[0] as unknown as Record<string, unknown>).version).toBe(3);
-			expect(readSessionInfoEntries(file)).toEqual([humanEntry]);
+			expect(manager.getEntry("concurrent-message")).toMatchObject(concurrentEntry);
+			expect(entries).toContainEqual(concurrentEntry);
+			expect(lockSpy).toHaveBeenCalledTimes(2);
 		} finally {
+			lockSpy.mockRestore();
+		}
+	});
+
+	it("performs transcript and name scans before acquiring the commit lock", () => {
+		const file = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
+		const legacyEntries = parseSessionEntries(readFileSync(file, "utf8"));
+		(legacyEntries[0] as SessionHeader).version = 2;
+		writeFileSync(file, `${legacyEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const originalLockSync = lockfile.lockSync.bind(lockfile);
+		scanProbe.lockHeld = false;
+		scanProbe.readsWhileLocked = 0;
+		const lockSpy = vi.spyOn(lockfile, "lockSync").mockImplementation(((
+			target: string,
+			options: Parameters<typeof lockfile.lockSync>[1],
+		) => {
+			const release = originalLockSync(target, options);
+			scanProbe.lockHeld = true;
+			return () => {
+				scanProbe.lockHeld = false;
+				release();
+			};
+		}) as typeof lockfile.lockSync);
+		try {
+			const manager = SessionManager.open(file);
+			manager.appendSessionInfo("Outside-lock scan", { origin: "human" });
+			expect(lockSpy).toHaveBeenCalledTimes(2);
+			expect(scanProbe.readsWhileLocked).toBe(0);
+		} finally {
+			scanProbe.lockHeld = false;
 			lockSpy.mockRestore();
 		}
 	});
@@ -123,6 +227,92 @@ describe("SessionManager session name transactions", () => {
 		expect(() => manager.materialize()).not.toThrow();
 	});
 
+	it("reconciles a crash after materialize link publication", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-materialize-crash-"));
+		tempDirs.push(dir);
+		const manager = SessionManager.create(dir, dir, { id: "materialize-crash-session" });
+		manager.appendCustomEntry("buffered", { retained: true });
+		const file = manager.getSessionFile()!;
+		const temporary = `${file}.materialize-crashed`;
+		const entries = [manager.getHeader(), ...manager.getEntries()];
+		writeFileSync(temporary, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		linkSync(temporary, file);
+
+		const reopened = SessionManager.open(file);
+
+		expect(existsSync(file)).toBe(true);
+		expect(existsSync(temporary)).toBe(false);
+		expect(reopened.getEntry(manager.getEntries()[0].id)).toBeDefined();
+	});
+
+	it("treats post-link cleanup failure as committed and removes the safe alias", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-materialize-cleanup-"));
+		tempDirs.push(dir);
+		const manager = SessionManager.create(dir, dir, { id: "materialize-cleanup-session" });
+		manager.appendCustomEntry("buffered");
+		const file = manager.getSessionFile()!;
+		scanProbe.materializeUnlinkFailures = 1;
+
+		expect(() => manager.materialize()).not.toThrow();
+
+		expect(existsSync(file)).toBe(true);
+		expect(readdirSync(dir).filter((name) => name.includes(".materialize-"))).toEqual([]);
+		expect(() => manager.materialize()).not.toThrow();
+	});
+
+	it("keeps a concurrent complete append during post-publication materialize recovery", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-materialize-concurrent-"));
+		tempDirs.push(dir);
+		const manager = SessionManager.create(dir, dir, { id: "materialize-concurrent-session" });
+		const managerEntryId = manager.appendCustomEntry("buffered");
+		const file = manager.getSessionFile()!;
+		const concurrentEntry = {
+			type: "custom",
+			id: "concurrent-materialize-entry",
+			parentId: managerEntryId,
+			timestamp,
+			customType: "concurrent-materialize",
+		};
+		scanProbe.materializeUnlinkFailures = 1;
+		scanProbe.materializeConcurrentAppendLine = `${JSON.stringify(concurrentEntry)}\n`;
+
+		expect(() => manager.materialize()).not.toThrow();
+
+		const entries = parseSessionEntries(readFileSync(file, "utf8"));
+		expect(entries).toContainEqual(manager.getEntry(managerEntryId));
+		expect(entries).toContainEqual(concurrentEntry);
+		expect(readdirSync(dir).filter((name) => name.includes(".materialize-"))).toEqual([]);
+		expect(() => manager.materialize()).not.toThrow();
+		expect(parseSessionEntries(readFileSync(file, "utf8"))).toEqual(entries);
+	});
+
+	it.each(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EBADF"])(
+		"treats unsupported directory fsync error %s as best-effort",
+		(code) => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-session-materialize-fsync-"));
+			tempDirs.push(dir);
+			const manager = SessionManager.create(dir, dir, { id: `materialize-fsync-${code}` });
+			manager.appendCustomEntry("buffered");
+			scanProbe.directoryFsyncErrorCode = code;
+
+			expect(() => manager.materialize()).not.toThrow();
+			expect(existsSync(manager.getSessionFile()!)).toBe(true);
+		},
+	);
+
+	it("keeps migrated manager state after a post-replacement directory fsync failure", () => {
+		const file = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
+		const entries = parseSessionEntries(readFileSync(file, "utf8"));
+		(entries[0] as SessionHeader).version = 2;
+		writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		scanProbe.directoryFsyncErrorCode = "EIO";
+
+		const manager = SessionManager.open(file);
+
+		expect(manager.getHeader()?.version).toBe(3);
+		expect((parseSessionEntries(readFileSync(file, "utf8"))[0] as SessionHeader).version).toBe(3);
+	});
+
 	it("publishes legacy migration rewrites by atomic replacement", () => {
 		const file = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
 		const legacyEntries = parseSessionEntries(readFileSync(file, "utf8"));
@@ -135,6 +325,193 @@ describe("SessionManager session name transactions", () => {
 		const after = statSync(file);
 		expect(after.ino).not.toBe(before.ino);
 		expect((parseSessionEntries(readFileSync(file, "utf8"))[0] as SessionHeader).version).toBe(3);
+	});
+
+	it("migrates a symlinked legacy session through one canonical physical identity", () => {
+		const target = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
+		const legacyEntries = parseSessionEntries(readFileSync(target, "utf8"));
+		(legacyEntries[0] as SessionHeader).version = 2;
+		writeFileSync(target, `${legacyEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const alias = join(dirname(target), "session-alias.jsonl");
+		symlinkSync(target, alias);
+
+		const manager = SessionManager.open(alias);
+
+		expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+		expect(manager.getSessionFile()).toBe(target);
+		expect((parseSessionEntries(readFileSync(target, "utf8"))[0] as SessionHeader).version).toBe(3);
+		manager.appendSessionInfo("Canonical name", { origin: "human" });
+		expect(SessionManager.open(alias).getSessionName()).toBe("Canonical name");
+		expect(SessionManager.open(target).getSessionName()).toBe("Canonical name");
+		expect(SessionManager.open(alias).getSessionId()).toBe(SessionManager.open(target).getSessionId());
+	});
+
+	it("binds one resolved target when a session symlink is retargeted during open", () => {
+		const firstTarget = createSessionFile();
+		const firstEntries = parseSessionEntries(readFileSync(firstTarget, "utf8"));
+		(firstEntries[0] as SessionHeader).version = 2;
+		writeFileSync(firstTarget, `${firstEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const secondTarget = join(dirname(firstTarget), "second-session.jsonl");
+		const secondEntries = structuredClone(firstEntries);
+		(secondEntries[0] as SessionHeader).version = 3;
+		(secondEntries[0] as SessionHeader).id = "second-session-id";
+		writeFileSync(secondTarget, `${secondEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const alias = join(dirname(firstTarget), "retargeted-alias.jsonl");
+		symlinkSync(firstTarget, alias);
+		const originalLockSync = lockfile.lockSync.bind(lockfile);
+		const lockSpy = vi.spyOn(lockfile, "lockSync").mockImplementationOnce(((
+			target: string,
+			options: Parameters<typeof lockfile.lockSync>[1],
+		) => {
+			unlinkSync(alias);
+			symlinkSync(secondTarget, alias);
+			return originalLockSync(target, options);
+		}) as typeof lockfile.lockSync);
+		try {
+			const manager = SessionManager.open(alias);
+			expect(manager.getSessionFile()).toBe(firstTarget);
+			expect(manager.getSessionId()).toBe("session-name-cas");
+			expect(SessionManager.open(alias).getSessionId()).toBe("second-session-id");
+		} finally {
+			lockSpy.mockRestore();
+		}
+	});
+
+	it("rejects dangling symlinks and stable hardlinked sessions without changing them", () => {
+		const file = createSessionFile();
+		const dangling = join(dirname(file), "dangling-session.jsonl");
+		symlinkSync(join(dirname(file), "missing-target.jsonl"), dangling);
+		expect(() => SessionManager.open(dangling)).toThrow(/does not resolve to an existing file/);
+
+		const hardLink = join(dirname(file), "hard-linked-session.jsonl");
+		linkSync(file, hardLink);
+		const before = readFileSync(file, "utf8");
+		expect(() => SessionManager.open(file)).toThrow(/multiple hard links.*cannot be safely opened/);
+		expect(() => SessionManager.open(hardLink)).toThrow(/multiple hard links.*cannot be safely opened/);
+		expect(readFileSync(file, "utf8")).toBe(before);
+		expect(readFileSync(hardLink, "utf8")).toBe(before);
+	});
+
+	it("fails closed before replacing a multiply linked legacy session", () => {
+		const file = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
+		const entries = parseSessionEntries(readFileSync(file, "utf8"));
+		(entries[0] as SessionHeader).version = 2;
+		writeFileSync(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const hardLink = join(dirname(file), "hard-linked-legacy-session.jsonl");
+		linkSync(file, hardLink);
+		const before = readFileSync(file, "utf8");
+
+		expect(() => SessionManager.open(file)).toThrow(/multiple hard links.*cannot be safely opened/);
+		expect(() => SessionManager.open(hardLink)).toThrow(/multiple hard links.*cannot be safely opened/);
+		expect(readFileSync(file, "utf8")).toBe(before);
+		expect(readFileSync(hardLink, "utf8")).toBe(before);
+	});
+
+	it("forks from one stable canonical symlink target and records its physical parent", () => {
+		const source = createSessionFile([messageEntry("source-message", null, "source")]);
+		const alias = join(dirname(source), "source-alias.jsonl");
+		symlinkSync(source, alias);
+		const targetDir = mkdtempSync(join(tmpdir(), "pi-session-fork-target-"));
+		tempDirs.push(targetDir);
+
+		const fork = SessionManager.forkFrom(alias, targetDir, targetDir, { id: "canonical-fork" });
+
+		expect(fork.getHeader()?.parentSession).toBe(source);
+		expect(fork.getEntry("source-message")).toBeDefined();
+	});
+
+	it("migrates a stable v1 fork snapshot without changing the source", () => {
+		const source = createSessionFile();
+		const sourceHeader = parseSessionEntries(readFileSync(source, "utf8"))[0] as SessionHeader;
+		delete sourceHeader.version;
+		const v1Messages = [
+			{
+				type: "message",
+				timestamp,
+				message: { role: "user", content: [{ type: "text", text: "first" }], timestamp: 1 },
+			},
+			{
+				type: "message",
+				timestamp,
+				message: { role: "user", content: [{ type: "text", text: "second" }], timestamp: 2 },
+			},
+		];
+		writeFileSync(source, `${[sourceHeader, ...v1Messages].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const sourceBefore = readFileSync(source);
+		const targetDir = mkdtempSync(join(tmpdir(), "pi-session-fork-v1-"));
+		tempDirs.push(targetDir);
+
+		const fork = SessionManager.forkFrom(source, targetDir, targetDir, { id: "migrated-v1-fork" });
+
+		const entries = fork.getEntries();
+		expect(fork.getHeader()?.version).toBe(3);
+		expect(entries).toHaveLength(2);
+		expect(new Set(entries.map((entry) => entry.id)).size).toBe(2);
+		expect(entries[0].parentId).toBeNull();
+		expect(entries[1].parentId).toBe(entries[0].id);
+		expect(fork.buildSessionContext().messages).toMatchObject([
+			{ content: [{ type: "text", text: "first" }] },
+			{ content: [{ type: "text", text: "second" }] },
+		]);
+		expect(readFileSync(source)).toEqual(sourceBefore);
+	});
+
+	it("rejects dangling and hardlinked fork sources without publishing a target", () => {
+		const source = createSessionFile([messageEntry("source-message", null, "source")]);
+		const dangling = join(dirname(source), "dangling-fork-source.jsonl");
+		symlinkSync(join(dirname(source), "missing-fork-source.jsonl"), dangling);
+		const hardLink = join(dirname(source), "hardlinked-fork-source.jsonl");
+		linkSync(source, hardLink);
+		const before = readFileSync(source, "utf8");
+		const targetDir = mkdtempSync(join(tmpdir(), "pi-session-fork-reject-"));
+		tempDirs.push(targetDir);
+
+		expect(() => SessionManager.forkFrom(dangling, targetDir, targetDir)).toThrow(
+			/does not resolve to an existing file/,
+		);
+		expect(() => SessionManager.forkFrom(source, targetDir, targetDir)).toThrow(
+			/multiple hard links.*cannot be safely opened/,
+		);
+		expect(readFileSync(source, "utf8")).toBe(before);
+		expect(readFileSync(hardLink, "utf8")).toBe(before);
+		expect(readdirSync(targetDir).filter((name) => name.endsWith(".jsonl"))).toEqual([]);
+	});
+
+	it("retries a fork source revision race without producing a torn fork", () => {
+		const source = createSessionFile([messageEntry("source-message", null, "source")]);
+		const concurrentEntry = messageEntry("fork-concurrent-message", "source-message", "concurrent");
+		const targetDir = mkdtempSync(join(tmpdir(), "pi-session-fork-race-"));
+		tempDirs.push(targetDir);
+		scanProbe.revisionRaceFile = source;
+		scanProbe.revisionRaceLine = `${JSON.stringify(concurrentEntry)}\n`;
+		scanProbe.revisionRaceReads = 1;
+
+		const fork = SessionManager.forkFrom(source, targetDir, targetDir, { id: "revision-race-fork" });
+
+		expect(fork.getEntry("source-message")).toBeDefined();
+		expect(fork.getEntry("fork-concurrent-message")).toMatchObject(concurrentEntry);
+		expect(parseSessionEntries(readFileSync(fork.getSessionFile()!, "utf8"))).toContainEqual(concurrentEntry);
+	});
+
+	it("pins a symlinked session directory before materializing a new session", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-session-dir-alias-"));
+		tempDirs.push(root);
+		const firstDir = join(root, "first");
+		const secondDir = join(root, "second");
+		mkdirSync(firstDir);
+		mkdirSync(secondDir);
+		const aliasDir = join(root, "current");
+		symlinkSync(firstDir, aliasDir, "dir");
+		const manager = SessionManager.create(root, aliasDir, { id: "pinned-directory-session" });
+		const file = manager.getSessionFile()!;
+		expect(dirname(file)).toBe(firstDir);
+		unlinkSync(aliasDir);
+		symlinkSync(secondDir, aliasDir, "dir");
+
+		manager.materialize();
+
+		expect(existsSync(join(firstDir, basename(file)))).toBe(true);
+		expect(existsSync(join(secondDir, basename(file)))).toBe(false);
 	});
 
 	it("conditionally writes only when the exact physical name revision matches", () => {
@@ -396,17 +773,69 @@ describe("SessionManager session name transactions", () => {
 		const liveFile = createSessionFile();
 		const liveManager = SessionManager.open(liveFile);
 		const before = readFileSync(liveFile, "utf8");
+		const beforeState = liveManager.getSessionNameState();
 		mkdirSync(`${liveFile}.lock`);
 		expect(() => liveManager.appendSessionInfo("Blocked", { origin: "human" })).toThrow();
 		expect(readFileSync(liveFile, "utf8")).toBe(before);
+		expect(liveManager.getSessionNameState()).toEqual(beforeState);
 
 		const staleFile = createSessionFile();
 		const staleManager = SessionManager.open(staleFile);
 		mkdirSync(`${staleFile}.lock`);
-		const oldTime = new Date(Date.now() - 25 * 60 * 60 * 1000);
+		const oldTime = new Date(Date.now() - 6 * 60 * 1000);
 		utimesSync(`${staleFile}.lock`, oldTime, oldTime);
 		expect(staleManager.appendSessionInfo("Recovered", { origin: "human" })).toEqual(expect.any(String));
 		expect(SessionManager.open(staleFile).getSessionName()).toBe("Recovered");
+	});
+
+	it("rolls back a failed session switch and ordinary append", () => {
+		const firstFile = createSessionFile([messageEntry("first-message", null, "first")]);
+		const manager = SessionManager.open(firstFile);
+		const previousFile = manager.getSessionFile();
+		const previousId = manager.getSessionId();
+		const previousLeaf = manager.getLeafId();
+		const invalidFile = join(dirname(firstFile), "invalid-session.jsonl");
+		writeFileSync(invalidFile, "not-json\n");
+
+		expect(() => manager.setSessionFile(invalidFile)).toThrow(/not a valid pi session/);
+		expect(manager.getSessionFile()).toBe(previousFile);
+		expect(manager.getSessionId()).toBe(previousId);
+		expect(manager.getLeafId()).toBe(previousLeaf);
+
+		const before = readFileSync(firstFile, "utf8");
+		mkdirSync(`${firstFile}.lock`);
+		expect(() => manager.appendCustomEntry("blocked-append")).toThrow();
+		expect(manager.getLeafId()).toBe(previousLeaf);
+		expect(readFileSync(firstFile, "utf8")).toBe(before);
+		rmSync(`${firstFile}.lock`, { recursive: true, force: true });
+		const nextId = manager.appendCustomEntry("successful-append");
+		const reopened = SessionManager.open(firstFile);
+		expect(reopened.getEntry(nextId)?.parentId).toBe(previousLeaf);
+	});
+
+	it("separates a valid unterminated final record before an ordinary append", () => {
+		const file = createSessionFile([messageEntry("message-one", null, "one")]);
+		const unterminated = readFileSync(file, "utf8").slice(0, -1);
+		writeFileSync(file, unterminated);
+		const manager = SessionManager.open(file);
+
+		const appendedId = manager.appendCustomEntry("after-unterminated-record");
+
+		const content = readFileSync(file, "utf8");
+		expect(content.startsWith(`${unterminated}\n`)).toBe(true);
+		expect(parseSessionEntries(content).map((entry) => (entry as { id?: string }).id)).toContain(appendedId);
+	});
+
+	it.each(['{"type":', "not-json"])("fails ordinary append on malformed unterminated tail %s", (tail) => {
+		const file = createSessionFile([messageEntry("message-one", null, "one")]);
+		appendFileSync(file, tail);
+		const manager = SessionManager.open(file);
+		const before = readFileSync(file, "utf8");
+		const beforeLeaf = manager.getLeafId();
+
+		expect(() => manager.appendCustomEntry("must-not-append")).toThrow(/malformed final JSONL entry/);
+		expect(readFileSync(file, "utf8")).toBe(before);
+		expect(manager.getLeafId()).toBe(beforeLeaf);
 	});
 
 	it("strictly scans sessions larger than 64 MiB without a rename ceiling", () => {

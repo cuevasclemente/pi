@@ -3,28 +3,32 @@ import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 }
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
+	type BigIntStats,
 	closeSync,
+	constants,
 	createReadStream,
 	existsSync,
 	fstatSync,
 	fsyncSync,
 	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { basename, dirname, join, parse, resolve } from "path";
 import lockfile from "proper-lockfile";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
-import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { canonicalizePath, normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -532,29 +536,171 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
 /**
- * Name transactions and existing-file rewrites share one physical-file lock.
- * The one-day stale threshold is deliberately conservative because synchronous
- * migration and name scans block lock heartbeat updates. Name scans retain only
- * one JSONL line, entry IDs, the header, and the latest session_info entry,
- * regardless of transcript size.
+ * Expensive transcript loads and name scans happen before acquiring this lock.
+ * Lock callbacks only verify a scanned physical revision and commit one append
+ * or atomic replacement, so synchronous scans cannot block heartbeat updates.
  */
-const SESSION_NAME_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
-const SESSION_NAME_LOCK_RETRY_ATTEMPTS = 30;
+const SESSION_FILE_LOCK_STALE_MS = 5 * 60 * 1000;
+const SESSION_FILE_LOCK_RETRY_ATTEMPTS = 30;
+const SESSION_REVISION_RETRY_ATTEMPTS = 30;
+
+function resolveMissingPathThroughExistingAncestor(filePath: string): string {
+	let ancestor = filePath;
+	const missingParts: string[] = [];
+	const root = parse(filePath).root;
+	while (ancestor !== root) {
+		try {
+			const stats = lstatSync(ancestor);
+			if (stats.isSymbolicLink()) {
+				try {
+					ancestor = realpathSync(ancestor);
+				} catch (error) {
+					throw new Error(`Session path alias does not resolve to an existing path: ${ancestor}`, {
+						cause: error,
+					});
+				}
+			}
+			return join(canonicalizePath(ancestor), ...missingParts.reverse());
+		} catch (error) {
+			if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) throw error;
+			missingParts.push(basename(ancestor));
+			ancestor = dirname(ancestor);
+		}
+	}
+	return join(root, ...missingParts.reverse());
+}
+
+function resolveSessionFileIdentity(sessionFile: string): string {
+	const resolved = resolvePath(sessionFile);
+	let lexical: ReturnType<typeof lstatSync>;
+	try {
+		lexical = lstatSync(resolved);
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+			return resolveMissingPathThroughExistingAncestor(resolved);
+		}
+		throw error;
+	}
+	if (!lexical.isSymbolicLink()) return canonicalizePath(resolved);
+	try {
+		return realpathSync(resolved);
+	} catch (error) {
+		throw new Error(`Session file alias does not resolve to an existing file: ${resolved}`, { cause: error });
+	}
+}
+
+interface SessionFileRevision {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+class SessionFileRevisionMismatchError extends Error {
+	constructor(sessionFile: string) {
+		super(`Session file changed before transaction commit: ${sessionFile}`);
+		this.name = "SessionFileRevisionMismatchError";
+	}
+}
+
+function revisionFromStats(stats: BigIntStats): SessionFileRevision {
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeNs: stats.mtimeNs,
+		ctimeNs: stats.ctimeNs,
+	};
+}
+
+function revisionsEqual(left: SessionFileRevision, right: SessionFileRevision): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+function assertRegularSessionStats(stats: BigIntStats, sessionFile: string): void {
+	if (!stats.isFile()) throw new Error(`Session path is not a regular file: ${sessionFile}`);
+}
+
+function assertSessionFileCanBeReplaced(fd: number, sessionFile: string): void {
+	const descriptorStats = fstatSync(fd, { bigint: true });
+	const pathStats = lstatSync(sessionFile, { bigint: true });
+	assertRegularSessionStats(descriptorStats, sessionFile);
+	assertRegularSessionStats(pathStats, sessionFile);
+	if (descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino) {
+		throw new SessionFileRevisionMismatchError(sessionFile);
+	}
+	if (descriptorStats.nlink !== 1n || pathStats.nlink !== 1n) {
+		throw new Error(`Session file has multiple hard links and cannot be safely replaced: ${sessionFile}`);
+	}
+}
+
+/** Verify that an open descriptor and the canonical path still identify one unchanged file. */
+function getStableSessionFileRevision(fd: number, sessionFile: string): SessionFileRevision {
+	const descriptorStats = fstatSync(fd, { bigint: true });
+	const pathStats = lstatSync(sessionFile, { bigint: true });
+	assertRegularSessionStats(descriptorStats, sessionFile);
+	assertRegularSessionStats(pathStats, sessionFile);
+	if (descriptorStats.nlink !== 1n || pathStats.nlink !== 1n) {
+		throw new Error(`Session file has multiple hard links and cannot be safely opened: ${sessionFile}`);
+	}
+	const descriptorRevision = revisionFromStats(descriptorStats);
+	if (!revisionsEqual(descriptorRevision, revisionFromStats(pathStats))) {
+		throw new SessionFileRevisionMismatchError(sessionFile);
+	}
+	return descriptorRevision;
+}
+
+function assertSessionFileRevision(fd: number, sessionFile: string, expectedRevision: SessionFileRevision): void {
+	if (!revisionsEqual(getStableSessionFileRevision(fd, sessionFile), expectedRevision)) {
+		throw new SessionFileRevisionMismatchError(sessionFile);
+	}
+}
+
+function fsyncParentDirectory(filePath: string): void {
+	if (process.platform === "win32") return;
+	const directoryFd = openSync(dirname(filePath), "r");
+	try {
+		try {
+			fsyncSync(directoryFd);
+		} catch (error) {
+			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+			// Some filesystems and platforms explicitly do not support directory fsync.
+			if (
+				code !== "EINVAL" &&
+				code !== "ENOTSUP" &&
+				code !== "EOPNOTSUPP" &&
+				code !== "ENOSYS" &&
+				code !== "EBADF"
+			) {
+				throw error;
+			}
+		}
+	} finally {
+		closeSync(directoryFd);
+	}
+}
 
 function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
 	let release: (() => void) | undefined;
 	const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
-	for (let attempt = 0; attempt <= SESSION_NAME_LOCK_RETRY_ATTEMPTS; attempt++) {
+	for (let attempt = 0; attempt <= SESSION_FILE_LOCK_RETRY_ATTEMPTS; attempt++) {
 		try {
 			release = lockfile.lockSync(sessionFile, {
-				stale: SESSION_NAME_LOCK_STALE_MS,
-				update: SESSION_NAME_LOCK_STALE_MS / 2,
+				stale: SESSION_FILE_LOCK_STALE_MS,
+				update: SESSION_FILE_LOCK_STALE_MS / 2,
 				retries: 0,
 			});
 			break;
 		} catch (error) {
 			const isLocked = typeof error === "object" && error !== null && "code" in error && error.code === "ELOCKED";
-			if (!isLocked || attempt === SESSION_NAME_LOCK_RETRY_ATTEMPTS) throw error;
+			if (!isLocked || attempt === SESSION_FILE_LOCK_RETRY_ATTEMPTS) throw error;
 			const waitMs = Math.ceil(Math.min(100, 10 * 1.2 ** attempt) * (1 + Math.random()));
 			Atomics.wait(lockWaitArray, 0, 0, waitMs);
 		}
@@ -564,6 +710,119 @@ function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
 		return operation();
 	} finally {
 		release();
+	}
+}
+
+function appendLineAtRevision(
+	sessionFile: string,
+	expectedRevision: SessionFileRevision,
+	line: Buffer | undefined,
+): void {
+	withSessionFileLock(sessionFile, () => {
+		const fd = line ? openSync(sessionFile, constants.O_WRONLY | constants.O_APPEND) : openSync(sessionFile, "r");
+		try {
+			assertSessionFileRevision(fd, sessionFile, expectedRevision);
+			if (line) {
+				writeFileSync(fd, line);
+				fsyncSync(fd);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	});
+}
+
+function prepareOrdinaryAppend(
+	sessionFile: string,
+	line: Buffer,
+): {
+	revision: SessionFileRevision;
+	line: Buffer;
+} {
+	const fd = openSync(sessionFile, "r");
+	try {
+		const initialRevision = getStableSessionFileRevision(fd, sessionFile);
+		if (initialRevision.size === 0n) throw new Error(`Session file is empty: ${sessionFile}`);
+		if (initialRevision.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+			throw new Error(`Session file is too large to append safely: ${sessionFile}`);
+		}
+		const size = Number(initialRevision.size);
+		const byte = Buffer.allocUnsafe(1);
+		if (readSync(fd, byte, 0, 1, size - 1) !== 1) throw new SessionFileRevisionMismatchError(sessionFile);
+		const terminated = byte[0] === 0x0a;
+		let recordEnd = terminated ? size - 1 : size;
+
+		// Ignore additional blank terminators and validate the latest physical record.
+		while (recordEnd > 0) {
+			if (readSync(fd, byte, 0, 1, recordEnd - 1) !== 1) {
+				throw new SessionFileRevisionMismatchError(sessionFile);
+			}
+			if (byte[0] !== 0x0a) break;
+			recordEnd--;
+		}
+		if (recordEnd === 0) throw new Error(`Session file has no final JSONL entry: ${sessionFile}`);
+
+		let recordStart = 0;
+		let searchEnd = recordEnd;
+		const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, recordEnd));
+		while (searchEnd > 0) {
+			const chunkStart = Math.max(0, searchEnd - scanBuffer.length);
+			const chunkLength = searchEnd - chunkStart;
+			let chunkOffset = 0;
+			while (chunkOffset < chunkLength) {
+				const bytesRead = readSync(
+					fd,
+					scanBuffer,
+					chunkOffset,
+					chunkLength - chunkOffset,
+					chunkStart + chunkOffset,
+				);
+				if (bytesRead === 0) throw new SessionFileRevisionMismatchError(sessionFile);
+				chunkOffset += bytesRead;
+			}
+			const newlineIndex = scanBuffer.subarray(0, chunkLength).lastIndexOf(0x0a);
+			if (newlineIndex !== -1) {
+				recordStart = chunkStart + newlineIndex + 1;
+				break;
+			}
+			searchEnd = chunkStart;
+		}
+		const record = Buffer.allocUnsafe(recordEnd - recordStart);
+		let recordOffset = 0;
+		while (recordOffset < record.length) {
+			const bytesRead = readSync(fd, record, recordOffset, record.length - recordOffset, recordStart + recordOffset);
+			if (bytesRead === 0) throw new SessionFileRevisionMismatchError(sessionFile);
+			recordOffset += bytesRead;
+		}
+		try {
+			const parsed = JSON.parse(record.toString("utf8")) as unknown;
+			if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
+		} catch {
+			throw new Error(`Session file has a malformed final JSONL entry: ${sessionFile}`);
+		}
+		if (!revisionsEqual(getStableSessionFileRevision(fd, sessionFile), initialRevision)) {
+			throw new SessionFileRevisionMismatchError(sessionFile);
+		}
+		return {
+			revision: initialRevision,
+			line: terminated ? line : Buffer.concat([Buffer.from("\n"), line]),
+		};
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function appendLineWithRevisionRetry(sessionFile: string, line: Buffer): void {
+	for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
+		try {
+			const prepared = prepareOrdinaryAppend(sessionFile, line);
+			appendLineAtRevision(sessionFile, prepared.revision, prepared.line);
+			return;
+		} catch (error) {
+			if (!(error instanceof SessionFileRevisionMismatchError) || attempt === SESSION_REVISION_RETRY_ATTEMPTS) {
+				throw error;
+			}
+		}
 	}
 }
 
@@ -632,21 +891,76 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	return entries;
 }
 
+interface SessionFileSnapshot {
+	entries: FileEntry[];
+	revision: SessionFileRevision;
+}
+
+function loadStableSessionFile(filePath: string): SessionFileSnapshot {
+	const fd = openSync(filePath, "r");
+	try {
+		const initialRevision = getStableSessionFileRevision(fd, filePath);
+		if (initialRevision.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+			throw new Error(`Session file is too large to load safely: ${filePath}`);
+		}
+		const initialSize = Number(initialRevision.size);
+		const entries: FileEntry[] = [];
+		const decoder = new StringDecoder("utf8");
+		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+		let pending = "";
+		let offset = 0;
+
+		while (offset < initialSize) {
+			const readLength = Math.min(buffer.length, initialSize - offset);
+			const bytesRead = readSync(fd, buffer, 0, readLength, offset);
+			if (bytesRead === 0) throw new SessionFileRevisionMismatchError(filePath);
+			offset += bytesRead;
+			pending += decoder.write(buffer.subarray(0, bytesRead));
+			let newlineIndex = pending.indexOf("\n");
+			while (newlineIndex !== -1) {
+				const entry = parseSessionEntryLine(pending.slice(0, newlineIndex));
+				if (entry) entries.push(entry);
+				pending = pending.slice(newlineIndex + 1);
+				newlineIndex = pending.indexOf("\n");
+			}
+		}
+		pending += decoder.end();
+		const finalEntry = parseSessionEntryLine(pending);
+		if (finalEntry) entries.push(finalEntry);
+		if (!revisionsEqual(getStableSessionFileRevision(fd, filePath), initialRevision)) {
+			throw new SessionFileRevisionMismatchError(filePath);
+		}
+		if (
+			entries.length > 0 &&
+			(entries[0].type !== "session" || typeof (entries[0] as { id?: unknown }).id !== "string")
+		) {
+			return { entries: [], revision: initialRevision };
+		}
+		return { entries, revision: initialRevision };
+	} finally {
+		closeSync(fd);
+	}
+}
+
 interface SessionNameTransactionScan {
 	header: SessionHeader;
 	latestSessionInfo: SessionInfoEntry | undefined;
 	occupiedIds: Set<string>;
+	revision: SessionFileRevision;
 }
 
-/** Strict, streaming physical read used only by locked name transactions. */
+/** Strict streaming name scan performed before the short commit lock. */
 function scanSessionForNameTransaction(filePath: string): SessionNameTransactionScan {
 	const fd = openSync(filePath, "r");
 	try {
-		const initialSize = fstatSync(fd).size;
-		if (initialSize === 0) {
+		const initialRevision = getStableSessionFileRevision(fd, filePath);
+		if (initialRevision.size === 0n) {
 			throw new Error(`Session file is empty: ${filePath}`);
 		}
-
+		if (initialRevision.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+			throw new Error(`Session file is too large to scan safely: ${filePath}`);
+		}
+		const initialSize = Number(initialRevision.size);
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
 		const occupiedIds = new Set<string>();
@@ -687,9 +1001,7 @@ function scanSessionForNameTransaction(filePath: string): SessionNameTransaction
 		while (offset < initialSize) {
 			const readLength = Math.min(buffer.length, initialSize - offset);
 			const bytesRead = readSync(fd, buffer, 0, readLength, offset);
-			if (bytesRead === 0) {
-				throw new Error(`Session file changed during name transaction: ${filePath}`);
-			}
+			if (bytesRead === 0) throw new SessionFileRevisionMismatchError(filePath);
 			offset += bytesRead;
 			pending += decoder.write(buffer.subarray(0, bytesRead));
 			let newlineIndex = pending.indexOf("\n");
@@ -700,8 +1012,8 @@ function scanSessionForNameTransaction(filePath: string): SessionNameTransaction
 			}
 		}
 		pending += decoder.end();
-		if (fstatSync(fd).size !== initialSize) {
-			throw new Error(`Session file changed during name transaction: ${filePath}`);
+		if (!revisionsEqual(getStableSessionFileRevision(fd, filePath), initialRevision)) {
+			throw new SessionFileRevisionMismatchError(filePath);
 		}
 		if (pending.length > 0) {
 			throw new Error(`Session file has an unterminated JSONL tail: ${filePath}`);
@@ -709,7 +1021,7 @@ function scanSessionForNameTransaction(filePath: string): SessionNameTransaction
 		if (!header) {
 			throw new Error(`Session file is not a valid pi session: ${filePath}`);
 		}
-		return { header, latestSessionInfo, occupiedIds };
+		return { header, latestSessionInfo, occupiedIds, revision: initialRevision };
 	} finally {
 		closeSync(fd);
 	}
@@ -1001,6 +1313,139 @@ async function listSessionsFromDir(
 	return sessions;
 }
 
+function sessionFileMatchesEntries(filePath: string, entries: readonly FileEntry[]): boolean {
+	let fd: number | undefined;
+	try {
+		fd = openSync(filePath, "r");
+		const descriptorStats = fstatSync(fd, { bigint: true });
+		const pathStats = lstatSync(filePath, { bigint: true });
+		assertRegularSessionStats(descriptorStats, filePath);
+		assertRegularSessionStats(pathStats, filePath);
+		const revision = revisionFromStats(descriptorStats);
+		if (!revisionsEqual(revision, revisionFromStats(pathStats))) return false;
+		let fileOffset = 0;
+		for (const entry of entries) {
+			const expected = Buffer.from(`${JSON.stringify(entry)}\n`);
+			const actual = Buffer.allocUnsafe(expected.length);
+			let lineOffset = 0;
+			while (lineOffset < actual.length) {
+				const bytesRead = readSync(fd, actual, lineOffset, actual.length - lineOffset, fileOffset + lineOffset);
+				if (bytesRead === 0) return false;
+				lineOffset += bytesRead;
+			}
+			if (!actual.equals(expected)) return false;
+			fileOffset += actual.length;
+		}
+		if (BigInt(fileOffset) !== revision.size) return false;
+		const finalDescriptorStats = fstatSync(fd, { bigint: true });
+		const finalPathStats = lstatSync(filePath, { bigint: true });
+		return (
+			revisionsEqual(revisionFromStats(finalDescriptorStats), revision) &&
+			revisionsEqual(revisionFromStats(finalPathStats), revision)
+		);
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function sessionFileHasEntriesPrefixAndCompleteTail(
+	filePath: string,
+	entries: readonly FileEntry[],
+	expectedIdentity: Pick<SessionFileRevision, "dev" | "ino">,
+): boolean {
+	let fd: number | undefined;
+	try {
+		fd = openSync(filePath, "r");
+		const descriptorStats = fstatSync(fd, { bigint: true });
+		const pathStats = lstatSync(filePath, { bigint: true });
+		assertRegularSessionStats(descriptorStats, filePath);
+		assertRegularSessionStats(pathStats, filePath);
+		const revision = revisionFromStats(descriptorStats);
+		if (
+			revision.dev !== expectedIdentity.dev ||
+			revision.ino !== expectedIdentity.ino ||
+			!revisionsEqual(revision, revisionFromStats(pathStats)) ||
+			revision.size > BigInt(Number.MAX_SAFE_INTEGER)
+		) {
+			return false;
+		}
+		const expectedPrefix = Buffer.from(entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+		if (revision.size < BigInt(expectedPrefix.length)) return false;
+		const content = Buffer.allocUnsafe(Number(revision.size));
+		let offset = 0;
+		while (offset < content.length) {
+			const bytesRead = readSync(fd, content, offset, content.length - offset, offset);
+			if (bytesRead === 0) return false;
+			offset += bytesRead;
+		}
+		if (!content.subarray(0, expectedPrefix.length).equals(expectedPrefix)) return false;
+		const tail = content.subarray(expectedPrefix.length);
+		if (tail.length > 0) {
+			if (tail[tail.length - 1] !== 0x0a) return false;
+			for (const line of tail.toString("utf8").split("\n")) {
+				if (!line) continue;
+				const parsed = JSON.parse(line) as unknown;
+				if (typeof parsed !== "object" || parsed === null) return false;
+			}
+		}
+		const finalDescriptorStats = fstatSync(fd, { bigint: true });
+		const finalPathStats = lstatSync(filePath, { bigint: true });
+		return (
+			revisionsEqual(revisionFromStats(finalDescriptorStats), revision) &&
+			revisionsEqual(revisionFromStats(finalPathStats), revision)
+		);
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+function getSamePhysicalMaterializeAliases(destination: string): string[] {
+	const destinationStats = lstatSync(destination, { bigint: true });
+	assertRegularSessionStats(destinationStats, destination);
+	const prefix = `${basename(destination)}.materialize-`;
+	const aliases: string[] = [];
+	for (const name of readdirSync(dirname(destination))) {
+		if (!name.startsWith(prefix)) continue;
+		const candidate = join(dirname(destination), name);
+		try {
+			const candidateStats = lstatSync(candidate, { bigint: true });
+			if (
+				candidateStats.isFile() &&
+				candidateStats.dev === destinationStats.dev &&
+				candidateStats.ino === destinationStats.ino
+			) {
+				aliases.push(candidate);
+			}
+		} catch (error) {
+			if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) {
+				throw error;
+			}
+		}
+	}
+	return aliases;
+}
+
+function cleanupMaterializeAliases(destination: string): number {
+	const aliases = getSamePhysicalMaterializeAliases(destination);
+	for (const alias of aliases) unlinkSync(alias);
+	return aliases.length;
+}
+
+function reconcileMaterializeAliasesBeforeOpen(destination: string): void {
+	const aliases = getSamePhysicalMaterializeAliases(destination);
+	if (aliases.length === 0) return;
+	for (const alias of aliases) unlinkSync(alias);
+	try {
+		fsyncParentDirectory(destination);
+	} catch {
+		// The destination was already committed; stable validation follows below.
+	}
+}
+
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
  *
@@ -1031,17 +1476,17 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
-		preloadedFileEntries?: FileEntry[],
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
-		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
-			mkdirSync(this.sessionDir, { recursive: true });
+		if (persist && this.sessionDir) {
+			if (!existsSync(this.sessionDir)) mkdirSync(this.sessionDir, { recursive: true });
+			this.sessionDir = canonicalizePath(this.sessionDir);
 		}
 
 		if (sessionFile) {
-			this._setSessionFile(sessionFile, preloadedFileEntries);
+			this._setSessionFile(sessionFile);
 		} else {
 			this.newSession(newSessionOptions);
 		}
@@ -1052,44 +1497,78 @@ export class SessionManager {
 		this._setSessionFile(sessionFile);
 	}
 
-	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
-		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
-
-			// If file was empty, initialize it with a valid session header. If it was
-			// non-empty but did not parse as a pi session, fail without modifying it.
-			if (this.fileEntries.length === 0) {
+	private _setSessionFile(sessionFile: string): void {
+		const previous = {
+			sessionFile: this.sessionFile,
+			sessionId: this.sessionId,
+			fileEntries: [...this.fileEntries],
+			byId: new Map(this.byId),
+			labelsById: new Map(this.labelsById),
+			labelTimestampsById: new Map(this.labelTimestampsById),
+			leafId: this.leafId,
+			flushed: this.flushed,
+		};
+		try {
+			// Bind aliases to one canonical path. Existing files are then loaded through
+			// a stable descriptor/path snapshot before any short commit lock is acquired.
+			this.sessionFile = resolveSessionFileIdentity(sessionFile);
+			if (existsSync(this.sessionFile)) {
+				reconcileMaterializeAliasesBeforeOpen(this.sessionFile);
 				const explicitPath = this.sessionFile;
-				if (statSync(explicitPath).size > 0) {
-					throw new Error(`Session file is not a valid pi session: ${explicitPath}`);
+				let loadedEntries: FileEntry[] | undefined;
+				for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
+					try {
+						const snapshot = loadStableSessionFile(explicitPath);
+						let entries = snapshot.entries;
+						if (entries.length === 0) {
+							if (snapshot.revision.size > 0n) {
+								throw new Error(`Session file is not a valid pi session: ${explicitPath}`);
+							}
+							entries = [
+								{
+									type: "session",
+									version: CURRENT_SESSION_VERSION,
+									id: createSessionId(),
+									timestamp: new Date().toISOString(),
+									cwd: this.cwd,
+								},
+							];
+							this._rewriteFile(snapshot.revision, entries);
+						} else if (migrateToCurrentVersion(entries)) {
+							this._rewriteFile(snapshot.revision, entries);
+						}
+						loadedEntries = entries;
+						break;
+					} catch (error) {
+						if (
+							!(error instanceof SessionFileRevisionMismatchError) ||
+							attempt === SESSION_REVISION_RETRY_ATTEMPTS
+						) {
+							throw error;
+						}
+					}
 				}
-				this.newSession();
-				this.sessionFile = explicitPath;
-				this._rewriteFile();
+				if (!loadedEntries) throw new Error(`Failed to load stable session file: ${explicitPath}`);
+				const header = loadedEntries.find((entry) => entry.type === "session") as SessionHeader | undefined;
+				this.fileEntries = loadedEntries;
+				this.sessionId = header?.id ?? createSessionId();
+				this._buildIndex();
 				this.flushed = true;
-				return;
+			} else {
+				const explicitPath = this.sessionFile;
+				this.newSession();
+				this.sessionFile = explicitPath; // preserve explicit path from --session flag
 			}
-
-			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			this.sessionId = header?.id ?? createSessionId();
-
-			if (migrateToCurrentVersion(this.fileEntries)) {
-				// A migration rewrites the complete physical file. Reload and migrate
-				// under the same lock used by session_info appends so a name committed
-				// after our initial read cannot be erased by a stale whole-file rewrite.
-				withSessionFileLock(this.sessionFile, () => {
-					this.fileEntries = loadEntriesFromFile(this.sessionFile!);
-					if (migrateToCurrentVersion(this.fileEntries)) this._rewriteFile();
-				});
-			}
-
-			this._buildIndex();
-			this.flushed = true;
-		} else {
-			const explicitPath = this.sessionFile;
-			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+		} catch (error) {
+			this.sessionFile = previous.sessionFile;
+			this.sessionId = previous.sessionId;
+			this.fileEntries = previous.fileEntries;
+			this.byId = previous.byId;
+			this.labelsById = previous.labelsById;
+			this.labelTimestampsById = previous.labelTimestampsById;
+			this.leafId = previous.leafId;
+			this.flushed = previous.flushed;
+			throw error;
 		}
 	}
 
@@ -1146,23 +1625,50 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(): void {
+	private _rewriteFile(
+		expectedRevision?: SessionFileRevision,
+		entries: readonly FileEntry[] = this.fileEntries,
+	): void {
 		if (!this.persist || !this.sessionFile) return;
 		const destination = this.sessionFile;
 		const temporary = `${destination}.rewrite-${process.pid}-${randomUUID()}`;
 		let fd: number | undefined;
+		let replaced = false;
 		try {
+			// Serialize and fsync the replacement before acquiring the commit lock.
 			fd = openSync(temporary, "wx", 0o600);
-			for (const entry of this.fileEntries) {
+			for (const entry of entries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = undefined;
-			renameSync(temporary, destination);
+
+			const publish = (): void => {
+				if (expectedRevision || existsSync(destination)) {
+					const currentFd = openSync(destination, "r");
+					try {
+						if (expectedRevision) assertSessionFileRevision(currentFd, destination, expectedRevision);
+						assertSessionFileCanBeReplaced(currentFd, destination);
+					} finally {
+						closeSync(currentFd);
+					}
+				}
+				renameSync(temporary, destination);
+				replaced = true;
+				fsyncParentDirectory(destination);
+			};
+			if (expectedRevision) {
+				withSessionFileLock(destination, publish);
+			} else {
+				publish();
+			}
 		} catch (error) {
 			if (fd !== undefined) closeSync(fd);
 			if (existsSync(temporary)) unlinkSync(temporary);
+			// renameSync already committed the replacement. Keep manager state aligned
+			// with that publication rather than reporting the whole transaction failed.
+			if (replaced && sessionFileMatchesEntries(destination, entries)) return;
 			throw error;
 		}
 	}
@@ -1176,26 +1682,67 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile || this.flushed) return;
 		const destination = this.sessionFile;
 		if (existsSync(destination)) {
+			// Reconcile a prior link-before-unlink crash only when a generated temp
+			// alias has the same physical identity and the destination has our content.
+			if (sessionFileMatchesEntries(destination, this.fileEntries)) {
+				const aliases = getSamePhysicalMaterializeAliases(destination);
+				if (aliases.length > 0) {
+					try {
+						for (const alias of aliases) unlinkSync(alias);
+						fsyncParentDirectory(destination);
+					} catch {
+						// The destination is already the authoritative committed publication.
+					}
+					this.flushed = true;
+					return;
+				}
+			}
 			throw new Error(`Session file already exists before materialization: ${destination}`);
 		}
 		const temporary = `${destination}.materialize-${process.pid}-${randomUUID()}`;
 		let fd: number | undefined;
+		let published = false;
+		let publishedIdentity: Pick<SessionFileRevision, "dev" | "ino"> | undefined;
 		try {
 			fd = openSync(temporary, "wx", 0o600);
 			for (const entry of this.fileEntries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
 			fsyncSync(fd);
+			const temporaryStats = fstatSync(fd, { bigint: true });
+			publishedIdentity = { dev: temporaryStats.dev, ino: temporaryStats.ino };
 			closeSync(fd);
 			fd = undefined;
 			// link is an atomic no-clobber publication on the same filesystem.
 			linkSync(temporary, destination);
+			published = true;
 			unlinkSync(temporary);
+			// Persist the final destination-only directory state before another
+			// component may durably publish this session path.
+			fsyncParentDirectory(destination);
 			this.flushed = true;
 		} catch (error) {
 			if (fd !== undefined) closeSync(fd);
-			if (existsSync(temporary)) unlinkSync(temporary);
-			throw error;
+			if (!published) {
+				if (existsSync(temporary)) unlinkSync(temporary);
+				throw error;
+			}
+			// linkSync already committed the destination. Suppress the post-publication
+			// error only when it is still that temp inode, our bytes are an exact prefix,
+			// and every concurrently appended trailing record is complete JSONL.
+			if (
+				!publishedIdentity ||
+				!sessionFileHasEntriesPrefixAndCompleteTail(destination, this.fileEntries, publishedIdentity)
+			) {
+				throw error;
+			}
+			try {
+				cleanupMaterializeAliases(destination);
+				fsyncParentDirectory(destination);
+			} catch {
+				// The verified destination remains the authoritative committed publication.
+			}
+			this.flushed = true;
 		}
 	}
 
@@ -1229,10 +1776,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				const sessionFile = this.sessionFile;
-				withSessionFileLock(sessionFile, () => {
-					appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
-				});
+				appendLineWithRevisionRetry(this.sessionFile, Buffer.from(`${JSON.stringify(entry)}\n`));
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1241,28 +1785,27 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
-			this.flushed = true;
+			this.materialize();
 		} else {
-			const sessionFile = this.sessionFile;
-			withSessionFileLock(sessionFile, () => {
-				appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
-			});
+			appendLineWithRevisionRetry(this.sessionFile, Buffer.from(`${JSON.stringify(entry)}\n`));
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		const previousLeafId = this.leafId;
+		const previousFlushed = this.flushed;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			this.leafId = previousLeafId;
+			this.flushed = previousFlushed;
+			throw error;
+		}
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1349,20 +1892,23 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	private _refreshSessionNameMetadata(entry: SessionInfoEntry | undefined): void {
+	private _assertCanRefreshSessionNameMetadata(entry: SessionInfoEntry | undefined): void {
 		if (!entry) return;
 		const existing = this.byId.get(entry.id);
-		if (existing) {
-			if (
-				existing.type !== "session_info" ||
+		if (
+			existing &&
+			(existing.type !== "session_info" ||
 				existing.name !== entry.name ||
 				existing.origin !== entry.origin ||
-				existing.parentId !== entry.parentId
-			) {
-				throw new Error(`Conflicting session entry ID during name refresh: ${entry.id}`);
-			}
-			return;
+				existing.parentId !== entry.parentId)
+		) {
+			throw new Error(`Conflicting session entry ID during name refresh: ${entry.id}`);
 		}
+	}
+
+	private _refreshSessionNameMetadata(entry: SessionInfoEntry | undefined): void {
+		this._assertCanRefreshSessionNameMetadata(entry);
+		if (!entry || this.byId.has(entry.id)) return;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 	}
@@ -1391,7 +1937,15 @@ export class SessionManager {
 			};
 			this.fileEntries.push(entry);
 			this.byId.set(entry.id, entry);
-			this._persist(entry);
+			const previousFlushed = this.flushed;
+			try {
+				this._persist(entry);
+			} catch (error) {
+				this.fileEntries.pop();
+				this.byId.delete(entry.id);
+				this.flushed = previousFlushed;
+				throw error;
+			}
 			return { written: true, entryId: entry.id };
 		};
 
@@ -1400,48 +1954,53 @@ export class SessionManager {
 		}
 
 		const sessionFile = this.sessionFile;
-		return withSessionFileLock(sessionFile, () => {
-			const physical = scanSessionForNameTransaction(sessionFile);
-			if (physical.header.id !== this.sessionId) {
-				throw new Error(`Session file changed while acquiring name lock: ${this.sessionFile}`);
-			}
-
-			// The scan is authoritative only for name metadata. Never replace the live
-			// conversation snapshot: a message writer can append after this scan, and
-			// replacing fileEntries would make the naming manager forget live state.
-			const physicalNameEntry = physical.latestSessionInfo;
-			const currentState: SessionNameState = physicalNameEntry
-				? { name: physicalNameEntry.name?.trim() || undefined, entryId: physicalNameEntry.id }
-				: { name: undefined, entryId: undefined };
-			this._refreshSessionNameMetadata(physicalNameEntry);
-			if (
-				expectedState &&
-				(currentState.entryId !== expectedState.entryId || currentState.name !== expectedState.name)
-			) {
-				return { written: false, currentState };
-			}
-
-			const occupiedIds = new Set([...this.byId.keys(), ...physical.occupiedIds]);
-			const entry: SessionInfoEntry = {
-				type: "session_info",
-				id: generateId(occupiedIds),
-				parentId: this.leafId,
-				timestamp: new Date().toISOString(),
-				name: sanitizedName,
-				...(options.origin ? { origin: options.origin } : {}),
-			};
-			const line = Buffer.from(`${JSON.stringify(entry)}\n`);
-			const fd = openSync(sessionFile, "a");
+		for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
 			try {
-				writeFileSync(fd, line);
-			} finally {
-				closeSync(fd);
-			}
+				const physical = scanSessionForNameTransaction(sessionFile);
+				if (physical.header.id !== this.sessionId) {
+					throw new Error(`Session file changed during name transaction: ${this.sessionFile}`);
+				}
 
-			this.fileEntries.push(entry);
-			this.byId.set(entry.id, entry);
-			return { written: true, entryId: entry.id };
-		});
+				// The outside-lock scan is authoritative only after the short commit lock
+				// verifies its exact physical revision. Never replace live conversation state.
+				const physicalNameEntry = physical.latestSessionInfo;
+				this._assertCanRefreshSessionNameMetadata(physicalNameEntry);
+				const currentState: SessionNameState = physicalNameEntry
+					? { name: physicalNameEntry.name?.trim() || undefined, entryId: physicalNameEntry.id }
+					: { name: undefined, entryId: undefined };
+				const matchesExpected =
+					!expectedState ||
+					(currentState.entryId === expectedState.entryId && currentState.name === expectedState.name);
+				let entry: SessionInfoEntry | undefined;
+				if (matchesExpected) {
+					const occupiedIds = new Set([...this.byId.keys(), ...physical.occupiedIds]);
+					entry = {
+						type: "session_info",
+						id: generateId(occupiedIds),
+						parentId: this.leafId,
+						timestamp: new Date().toISOString(),
+						name: sanitizedName,
+						...(options.origin ? { origin: options.origin } : {}),
+					};
+				}
+				appendLineAtRevision(
+					sessionFile,
+					physical.revision,
+					entry ? Buffer.from(`${JSON.stringify(entry)}\n`) : undefined,
+				);
+
+				this._refreshSessionNameMetadata(physicalNameEntry);
+				if (!entry) return { written: false, currentState };
+				this.fileEntries.push(entry);
+				this.byId.set(entry.id, entry);
+				return { written: true, entryId: entry.id };
+			} catch (error) {
+				if (!(error instanceof SessionFileRevisionMismatchError) || attempt === SESSION_REVISION_RETRY_ATTEMPTS) {
+					throw error;
+				}
+			}
+		}
+		throw new Error(`Failed to commit stable session name transaction: ${sessionFile}`);
 	}
 
 	/**
@@ -1717,6 +2276,7 @@ export class SessionManager {
 				throw new Error("Session metadata cannot be selected as a branch target");
 			}
 		}
+		const previousLeafId = this.leafId;
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
@@ -1729,8 +2289,13 @@ export class SessionManager {
 			usage,
 			fromHook,
 		};
-		this._appendEntry(entry);
-		return entry.id;
+		try {
+			this._appendEntry(entry);
+			return entry.id;
+		} catch (error) {
+			this.leafId = previousLeafId;
+			throw error;
+		}
 	}
 
 	/**
@@ -1857,25 +2422,18 @@ export class SessionManager {
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
-		const resolvedPath = resolvePath(path);
-		let header: SessionHeader | null = null;
-		let preloadedFileEntries: FileEntry[] | undefined;
-		if (cwdOverride === undefined && existsSync(resolvedPath)) {
-			try {
-				header = readSessionHeader(resolvedPath);
-			} catch (error) {
-				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
-				// The bounded scan is only a discovery optimization. A full load remains
-				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
-				const firstEntry = preloadedFileEntries[0];
-				header = firstEntry?.type === "session" ? firstEntry : null;
-			}
-		}
-		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
-		// If no sessionDir provided, derive from file's parent directory
+		const resolvedPath = resolveSessionFileIdentity(path);
+		// If no sessionDir is provided, derive it from the physical file's parent.
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
-		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+		// _setSessionFile performs one authoritative stable physical-file load and
+		// revision-validates any migration commit. Derive cwd from those same entries
+		// afterward so alias retargeting cannot mix one file's header with another.
+		const manager = new SessionManager(cwdOverride ?? process.cwd(), dir, resolvedPath, true);
+		if (cwdOverride === undefined) {
+			const header = manager.fileEntries.find((entry) => entry.type === "session") as SessionHeader | undefined;
+			if (header) manager.cwd = getSessionHeaderCwd(header) ?? process.cwd();
+		}
+		return manager;
 	}
 
 	/**
@@ -1911,10 +2469,21 @@ export class SessionManager {
 		sessionDir?: string,
 		options?: NewSessionOptions,
 	): SessionManager {
-		const resolvedSourcePath = resolvePath(sourcePath);
+		const resolvedSourcePath = resolveSessionFileIdentity(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
-		if (sourceEntries.length === 0) {
+		reconcileMaterializeAliasesBeforeOpen(resolvedSourcePath);
+		let sourceEntries: FileEntry[] | undefined;
+		for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
+			try {
+				sourceEntries = loadStableSessionFile(resolvedSourcePath).entries;
+				break;
+			} catch (error) {
+				if (!(error instanceof SessionFileRevisionMismatchError) || attempt === SESSION_REVISION_RETRY_ATTEMPTS) {
+					throw error;
+				}
+			}
+		}
+		if (!sourceEntries || sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
 
@@ -1922,6 +2491,9 @@ export class SessionManager {
 		if (!sourceHeader) {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
+		// The fork header always declares the current format, so migrate the stable
+		// source snapshot in memory before copying it. Never rewrite the source file.
+		migrateToCurrentVersion(sourceEntries);
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
 		if (!existsSync(dir)) {
