@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added coordinated, non-structural session-name metadata with optional human/automatic provenance and exact-revision compare-and-set writes. File-backed naming strictly streams sessions of any size under a shared lock, and session metadata cannot be selected as a new branch target.
+
 ## [0.84.1] - 2026-08-07
 
 ### New Features
