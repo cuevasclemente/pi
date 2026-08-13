@@ -1209,6 +1209,7 @@ export class ExtensionRunner {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
+						originalText: text,
 						images: currentImages,
 						source,
 						streamingBehavior,

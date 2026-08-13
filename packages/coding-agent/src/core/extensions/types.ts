@@ -830,8 +830,10 @@ export type InputSource = "interactive" | "rpc" | "extension";
 /** Fired when user input is received, before agent processing */
 export interface InputEvent {
 	type: "input";
-	/** The input text */
+	/** The current input text, including transforms returned by earlier handlers. */
 	text: string;
+	/** Immutable text received before any input handler transforms. */
+	originalText: string;
 	/** Attached images, if any */
 	images?: ImageContent[];
 	/** Where the input came from */
