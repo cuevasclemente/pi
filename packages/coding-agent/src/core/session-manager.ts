@@ -528,13 +528,41 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
 /**
- * Name transactions synchronously stream the physical file while holding the lock.
- * The one-day stale threshold is deliberately conservative because the synchronous
- * scan blocks lock heartbeat updates. The scan retains only one JSONL line, entry
- * IDs, the header, and the latest session_info entry, regardless of transcript size.
+ * Name transactions and existing-file rewrites share one physical-file lock.
+ * The one-day stale threshold is deliberately conservative because synchronous
+ * migration and name scans block lock heartbeat updates. Name scans retain only
+ * one JSONL line, entry IDs, the header, and the latest session_info entry,
+ * regardless of transcript size.
  */
 const SESSION_NAME_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const SESSION_NAME_LOCK_RETRY_ATTEMPTS = 30;
+
+function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
+	let release: (() => void) | undefined;
+	const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
+	for (let attempt = 0; attempt <= SESSION_NAME_LOCK_RETRY_ATTEMPTS; attempt++) {
+		try {
+			release = lockfile.lockSync(sessionFile, {
+				stale: SESSION_NAME_LOCK_STALE_MS,
+				update: SESSION_NAME_LOCK_STALE_MS / 2,
+				retries: 0,
+			});
+			break;
+		} catch (error) {
+			const isLocked = typeof error === "object" && error !== null && "code" in error && error.code === "ELOCKED";
+			if (!isLocked || attempt === SESSION_NAME_LOCK_RETRY_ATTEMPTS) throw error;
+			const waitMs = Math.ceil(Math.min(100, 10 * 1.2 ** attempt) * (1 + Math.random()));
+			Atomics.wait(lockWaitArray, 0, 0, waitMs);
+		}
+	}
+	if (!release) throw new Error(`Failed to acquire session file lock: ${sessionFile}`);
+	try {
+		return operation();
+	} finally {
+		release();
+	}
+}
+
 /** Bound synchronous header discovery while allowing large cwd and custom metadata fields. */
 const MAX_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
 
@@ -1043,7 +1071,13 @@ export class SessionManager {
 			this.sessionId = header?.id ?? createSessionId();
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
+				// A migration rewrites the complete physical file. Reload and migrate
+				// under the same lock used by session_info appends so a name committed
+				// after our initial read cannot be erased by a stale whole-file rewrite.
+				withSessionFileLock(this.sessionFile, () => {
+					this.fileEntries = loadEntriesFromFile(this.sessionFile!);
+					if (migrateToCurrentVersion(this.fileEntries)) this._rewriteFile();
+				});
 			}
 
 			this._buildIndex();
@@ -1314,29 +1348,9 @@ export class SessionManager {
 			return appendToCurrentState();
 		}
 
-		let release: (() => void) | undefined;
-		const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
-		for (let attempt = 0; attempt <= SESSION_NAME_LOCK_RETRY_ATTEMPTS; attempt++) {
-			try {
-				release = lockfile.lockSync(this.sessionFile, {
-					stale: SESSION_NAME_LOCK_STALE_MS,
-					update: SESSION_NAME_LOCK_STALE_MS / 2,
-					retries: 0,
-				});
-				break;
-			} catch (error) {
-				const isLocked = typeof error === "object" && error !== null && "code" in error && error.code === "ELOCKED";
-				if (!isLocked || attempt === SESSION_NAME_LOCK_RETRY_ATTEMPTS) throw error;
-				const waitMs = Math.ceil(Math.min(100, 10 * 1.2 ** attempt) * (1 + Math.random()));
-				Atomics.wait(lockWaitArray, 0, 0, waitMs);
-			}
-		}
-		if (!release) {
-			throw new Error(`Failed to acquire session name lock: ${this.sessionFile}`);
-		}
-
-		try {
-			const physical = scanSessionForNameTransaction(this.sessionFile);
+		const sessionFile = this.sessionFile;
+		return withSessionFileLock(sessionFile, () => {
+			const physical = scanSessionForNameTransaction(sessionFile);
 			if (physical.header.id !== this.sessionId) {
 				throw new Error(`Session file changed while acquiring name lock: ${this.sessionFile}`);
 			}
@@ -1366,7 +1380,7 @@ export class SessionManager {
 				...(options.origin ? { origin: options.origin } : {}),
 			};
 			const line = Buffer.from(`${JSON.stringify(entry)}\n`);
-			const fd = openSync(this.sessionFile, "a");
+			const fd = openSync(sessionFile, "a");
 			try {
 				writeFileSync(fd, line);
 			} finally {
@@ -1376,9 +1390,7 @@ export class SessionManager {
 			this.fileEntries.push(entry);
 			this.byId.set(entry.id, entry);
 			return { written: true, entryId: entry.id };
-		} finally {
-			release();
-		}
+		});
 	}
 
 	/**

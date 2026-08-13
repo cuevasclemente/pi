@@ -14,7 +14,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { afterEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	parseSessionEntries,
 	type SessionInfoEntry,
@@ -68,6 +69,37 @@ afterEach(() => {
 });
 
 describe("SessionManager session name transactions", () => {
+	it("reloads under the shared lock before a legacy whole-file migration rewrite", () => {
+		const file = createSessionFile();
+		const legacyHeader = JSON.parse(readFileSync(file, "utf8").trim()) as Record<string, unknown>;
+		legacyHeader.version = 2;
+		writeFileSync(file, `${JSON.stringify(legacyHeader)}\n`);
+		const humanEntry = {
+			type: "session_info",
+			id: "human-during-migration",
+			parentId: null,
+			timestamp,
+			name: "Human during migration",
+			origin: "human",
+		};
+		const originalLockSync = lockfile.lockSync.bind(lockfile);
+		const lockSpy = vi.spyOn(lockfile, "lockSync").mockImplementationOnce(((target: string, options: object) => {
+			// Simulate a cooperating writer committing after the migration manager's
+			// initial stale read but before it owns the shared physical-file lock.
+			appendFileSync(file, `${JSON.stringify(humanEntry)}\n`);
+			return originalLockSync(target, options as any);
+		}) as typeof lockfile.lockSync);
+		try {
+			const manager = SessionManager.open(file);
+			expect(manager.getSessionName()).toBe("Human during migration");
+			const entries = parseSessionEntries(readFileSync(file, "utf8"));
+			expect((entries[0] as unknown as Record<string, unknown>).version).toBe(3);
+			expect(readSessionInfoEntries(file)).toEqual([humanEntry]);
+		} finally {
+			lockSpy.mockRestore();
+		}
+	});
+
 	it("conditionally writes only when the exact physical name revision matches", () => {
 		const file = createSessionFile();
 		const first = SessionManager.open(file);
