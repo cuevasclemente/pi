@@ -298,18 +298,23 @@ Set `label` to `undefined` to clear a label.
 Session metadata (e.g., user-defined display name). Set via `/name`, `--name` / `-n`, or `pi.setSessionName()` in extensions.
 
 ```json
-{"type":"session_info","id":"k1l2m3n4","parentId":"j0k1l2m3","timestamp":"2024-12-03T14:35:00.000Z","name":"Refactor auth module"}
+{"type":"session_info","id":"k1l2m3n4","parentId":"j0k1l2m3","timestamp":"2024-12-03T14:35:00.000Z","name":"Refactor auth module","origin":"human"}
 ```
 
-The session name is displayed in the session selector (`/resume`) instead of the first message when set.
+`origin` is optional and is either `"human"` or `"automatic"`. A missing value from an older writer means human/unknown, not automatic.
+
+`session_info` is side metadata, not a conversation-tree position. New name writes record the current conversation leaf in `parentId` for provenance, but do not advance the leaf. Later messages remain children of the same conversation entry, and `branch()`/`branchWithSummary()` reject a `session_info` target. Older files may contain messages parented through `session_info`; Pi still traverses those legacy links when rebuilding context.
+
+The latest physical `session_info` entry is the canonical name revision, including entries whose empty name explicitly clears the title. The session name is displayed in the session selector (`/resume`) instead of the first message when set.
 
 ## Tree Structure
 
-Entries form a tree:
-- First entry has `parentId: null`
-- Each subsequent entry points to its parent via `parentId`
-- Branching creates new children from an earlier entry
-- The "leaf" is the current position in the tree
+Conversation entries form a tree:
+- The first conversation entry has `parentId: null`
+- Each subsequent conversation entry points to its parent via `parentId`
+- Branching creates new children from an earlier conversation entry
+- The "leaf" is the current conversation position
+- `session_info` entries are side metadata and never become the leaf
 
 ```
 [user msg] ─── [assistant] ─── [user msg] ─── [assistant] ─┬─ [user msg] ← current leaf
@@ -379,6 +384,9 @@ for (const line of lines) {
     case "thinking_level_change":
       console.log(`[${entry.id}] Thinking: ${entry.thinkingLevel}`);
       break;
+    case "session_info":
+      console.log(`[${entry.id}] Name: ${entry.name ?? "(cleared)"} (${entry.origin ?? "human/unknown"})`);
+      break;
   }
 }
 ```
@@ -403,13 +411,29 @@ Key methods for working with sessions programmatically.
 - `setSessionFile(path)` - Switch to a different session file
 - `createBranchedSession(leafId)` - Extract branch to new session file
 
-### Instance Methods - Appending (all return entry ID)
+Name compare-and-set uses the exact latest metadata revision, not name equality:
+
+```typescript
+interface SessionNameState {
+  name: string | undefined;
+  entryId: string | undefined;
+}
+
+type SessionNameWriteResult =
+  | { written: true; entryId: string }
+  | { written: false; currentState: SessionNameState };
+```
+
+This makes an explicit clear or a same-value human rewrite defeat an automatic writer holding stale state. File-backed name transactions use a shared lock, strictly stream-validate the physical JSONL without retaining the full transcript, and fail closed on malformed or unterminated entries.
+
+### Instance Methods - Appending (all unconditional methods return entry ID)
 - `appendMessage(message)` - Add message
 - `appendThinkingLevelChange(level)` - Record thinking change
 - `appendModelChange(provider, modelId)` - Record model change
 - `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?)` - Add compaction
 - `appendCustomEntry(customType, data?)` - Extension state (not in context)
-- `appendSessionInfo(name)` - Set session display name
+- `appendSessionInfo(name, options?)` - Unconditionally set the display name under the shared file lock; `options.origin` defaults to `"human"`
+- `appendSessionInfoIfCurrent(name, expectedState, options?)` - Set the name only when the latest physical name revision exactly matches `expectedState`
 - `appendCustomMessageEntry(customType, content, display, details?)` - Extension message (in context)
 - `appendLabelChange(targetId, label)` - Set/clear label
 
@@ -421,16 +445,17 @@ Key methods for working with sessions programmatically.
 - `getTree()` - Get full tree structure
 - `getChildren(parentId)` - Get direct children
 - `getLabel(id)` - Get label for entry
-- `branch(entryId)` - Move leaf to earlier entry
+- `branch(entryId)` - Move leaf to an earlier conversation entry; rejects `session_info`
 - `resetLeaf()` - Reset leaf to null (before any entries)
-- `branchWithSummary(entryId, summary, details?, fromHook?)` - Branch with context summary
+- `branchWithSummary(entryId, summary, details?, fromHook?)` - Branch with context summary; rejects `session_info`
 
 ### Instance Methods - Context & Info
 - `buildContextEntries()` - Get active branch entries with compaction applied
 - `buildSessionContext()` - Get messages, thinkingLevel, and model for LLM
 - `getEntries()` - All entries (excluding header)
 - `getHeader()` - Session header metadata
-- `getSessionName()` - Get display name from latest session_info entry
+- `getSessionName()` - Get display name from the latest `session_info` entry
+- `getSessionNameState()` - Get `{ name, entryId }` for exact-revision compare-and-set naming
 - `getCwd()` - Working directory
 - `getSessionDir()` - Session storage directory
 - `getSessionId()` - Session UUID

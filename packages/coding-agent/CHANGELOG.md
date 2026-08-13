@@ -9,6 +9,8 @@
 - Added a fullscreen exit output setting to choose between printing the final transcript and only a session resume hint.
 - Added the `defaultTools` setting for configuring the initial built-in tool selection globally or per project.
 - Added `--use-theme <name[/name]>` to choose an initial per-run interactive theme without changing saved settings ([#7722](https://github.com/earendil-works/pi/pull/7722) by [@rwachtler](https://github.com/rwachtler)).
+- Added coordinated, non-structural session-name metadata with optional human/automatic provenance and exact-revision compare-and-set writes. File-backed appends and atomic existing-session migration rewrites share one lock so stale migration snapshots cannot erase concurrent entries; new sessions can be atomically materialized before publishing their path; naming strictly streams sessions of any size, and session metadata cannot be selected as a new branch target.
+- Added immutable `InputEvent.originalText` so extensions can distinguish raw input from `event.text` transformed by earlier input handlers.
 
 ### Changed
 

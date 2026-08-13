@@ -6,15 +6,21 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fstatSync,
+	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
+import lockfile from "proper-lockfile";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -114,10 +120,28 @@ export interface LabelEntry extends SessionEntryBase {
 	label: string | undefined;
 }
 
+export type SessionNameOrigin = "human" | "automatic";
+
+export interface SessionNameWriteOptions {
+	origin?: SessionNameOrigin;
+}
+
+export interface SessionNameState {
+	name: string | undefined;
+	/** ID of the latest session_info entry, including an explicit clear. */
+	entryId: string | undefined;
+}
+
+export type SessionNameWriteResult =
+	| { written: true; entryId: string }
+	| { written: false; currentState: SessionNameState };
+
 /** Session metadata entry (e.g., user-defined display name). */
 export interface SessionInfoEntry extends SessionEntryBase {
 	type: "session_info";
 	name?: string;
+	/** Optional provenance. Missing values from older writers are human/unknown. */
+	origin?: SessionNameOrigin;
 }
 
 /**
@@ -203,6 +227,7 @@ export type ReadonlySessionManager = Pick<
 	| "getEntries"
 	| "getTree"
 	| "getSessionName"
+	| "getSessionNameState"
 >;
 
 function createSessionId(): string {
@@ -322,6 +347,15 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+function getLatestSessionInfoEntry(entries: readonly FileEntry[]): SessionInfoEntry | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].type === "session_info") {
+			return entries[i] as SessionInfoEntry;
+		}
+	}
+	return undefined;
+}
+
 function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntry>): Map<string, SessionEntry> {
 	if (byId) return byId;
 	const index = new Map<string, SessionEntry>();
@@ -344,7 +378,14 @@ function buildSessionPath(
 	if (leafId) {
 		leaf = index.get(leafId);
 	}
-	leaf ??= entries[entries.length - 1];
+	if (!leaf) {
+		for (let i = entries.length - 1; i >= 0; i--) {
+			if (entries[i].type !== "session_info") {
+				leaf = entries[i];
+				break;
+			}
+		}
+	}
 	if (!leaf) {
 		return [];
 	}
@@ -490,6 +531,42 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
+/**
+ * Name transactions and existing-file rewrites share one physical-file lock.
+ * The one-day stale threshold is deliberately conservative because synchronous
+ * migration and name scans block lock heartbeat updates. Name scans retain only
+ * one JSONL line, entry IDs, the header, and the latest session_info entry,
+ * regardless of transcript size.
+ */
+const SESSION_NAME_LOCK_STALE_MS = 24 * 60 * 60 * 1000;
+const SESSION_NAME_LOCK_RETRY_ATTEMPTS = 30;
+
+function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
+	let release: (() => void) | undefined;
+	const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
+	for (let attempt = 0; attempt <= SESSION_NAME_LOCK_RETRY_ATTEMPTS; attempt++) {
+		try {
+			release = lockfile.lockSync(sessionFile, {
+				stale: SESSION_NAME_LOCK_STALE_MS,
+				update: SESSION_NAME_LOCK_STALE_MS / 2,
+				retries: 0,
+			});
+			break;
+		} catch (error) {
+			const isLocked = typeof error === "object" && error !== null && "code" in error && error.code === "ELOCKED";
+			if (!isLocked || attempt === SESSION_NAME_LOCK_RETRY_ATTEMPTS) throw error;
+			const waitMs = Math.ceil(Math.min(100, 10 * 1.2 ** attempt) * (1 + Math.random()));
+			Atomics.wait(lockWaitArray, 0, 0, waitMs);
+		}
+	}
+	if (!release) throw new Error(`Failed to acquire session file lock: ${sessionFile}`);
+	try {
+		return operation();
+	} finally {
+		release();
+	}
+}
+
 /** Bound synchronous header discovery while allowing large cwd and custom metadata fields. */
 const MAX_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
 
@@ -553,6 +630,89 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	}
 
 	return entries;
+}
+
+interface SessionNameTransactionScan {
+	header: SessionHeader;
+	latestSessionInfo: SessionInfoEntry | undefined;
+	occupiedIds: Set<string>;
+}
+
+/** Strict, streaming physical read used only by locked name transactions. */
+function scanSessionForNameTransaction(filePath: string): SessionNameTransactionScan {
+	const fd = openSync(filePath, "r");
+	try {
+		const initialSize = fstatSync(fd).size;
+		if (initialSize === 0) {
+			throw new Error(`Session file is empty: ${filePath}`);
+		}
+
+		const decoder = new StringDecoder("utf8");
+		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+		const occupiedIds = new Set<string>();
+		let header: SessionHeader | undefined;
+		let latestSessionInfo: SessionInfoEntry | undefined;
+		let pending = "";
+		let offset = 0;
+
+		const processLine = (line: string): void => {
+			if (!line.trim()) return;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				throw new Error(`Session file has a malformed JSONL entry: ${filePath}`);
+			}
+			if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) {
+				throw new Error(`Session file has a non-object JSONL entry: ${filePath}`);
+			}
+			const entry = parsed as FileEntry;
+			if (!header) {
+				if (entry.type !== "session" || typeof (entry as { id?: unknown }).id !== "string") {
+					throw new Error(`Session file is not a valid pi session: ${filePath}`);
+				}
+				header = entry;
+				return;
+			}
+			if (entry.type === "session") {
+				throw new Error(`Session file has multiple headers: ${filePath}`);
+			}
+			if (typeof (entry as { id?: unknown }).id !== "string") {
+				throw new Error(`Session file entry has no valid ID: ${filePath}`);
+			}
+			occupiedIds.add(entry.id);
+			if (entry.type === "session_info") latestSessionInfo = entry;
+		};
+
+		while (offset < initialSize) {
+			const readLength = Math.min(buffer.length, initialSize - offset);
+			const bytesRead = readSync(fd, buffer, 0, readLength, offset);
+			if (bytesRead === 0) {
+				throw new Error(`Session file changed during name transaction: ${filePath}`);
+			}
+			offset += bytesRead;
+			pending += decoder.write(buffer.subarray(0, bytesRead));
+			let newlineIndex = pending.indexOf("\n");
+			while (newlineIndex !== -1) {
+				processLine(pending.slice(0, newlineIndex));
+				pending = pending.slice(newlineIndex + 1);
+				newlineIndex = pending.indexOf("\n");
+			}
+		}
+		pending += decoder.end();
+		if (fstatSync(fd).size !== initialSize) {
+			throw new Error(`Session file changed during name transaction: ${filePath}`);
+		}
+		if (pending.length > 0) {
+			throw new Error(`Session file has an unterminated JSONL tail: ${filePath}`);
+		}
+		if (!header) {
+			throw new Error(`Session file is not a valid pi session: ${filePath}`);
+		}
+		return { header, latestSessionInfo, occupiedIds };
+	} finally {
+		closeSync(fd);
+	}
 }
 
 /**
@@ -915,7 +1075,13 @@ export class SessionManager {
 			this.sessionId = header?.id ?? createSessionId();
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
+				// A migration rewrites the complete physical file. Reload and migrate
+				// under the same lock used by session_info appends so a name committed
+				// after our initial read cannot be erased by a stale whole-file rewrite.
+				withSessionFileLock(this.sessionFile, () => {
+					this.fileEntries = loadEntriesFromFile(this.sessionFile!);
+					if (migrateToCurrentVersion(this.fileEntries)) this._rewriteFile();
+				});
 			}
 
 			this._buildIndex();
@@ -963,7 +1129,11 @@ export class SessionManager {
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
-			this.leafId = entry.id;
+			// session_info is side metadata. Legacy descendants can still point to it,
+			// but the metadata entry itself never becomes the conversation leaf.
+			if (entry.type !== "session_info") {
+				this.leafId = entry.id;
+			}
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -978,13 +1148,54 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		const destination = this.sessionFile;
+		const temporary = `${destination}.rewrite-${process.pid}-${randomUUID()}`;
+		let fd: number | undefined;
 		try {
+			fd = openSync(temporary, "wx", 0o600);
 			for (const entry of this.fileEntries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
-		} finally {
+			fsyncSync(fd);
 			closeSync(fd);
+			fd = undefined;
+			renameSync(temporary, destination);
+		} catch (error) {
+			if (fd !== undefined) closeSync(fd);
+			if (existsSync(temporary)) unlinkSync(temporary);
+			throw error;
+		}
+	}
+
+	/**
+	 * Atomically publish a newly-created session before another component stores
+	 * its proposed path as durable identity. Existing sessions are already
+	 * materialized; an unexpected path collision fails closed.
+	 */
+	materialize(): void {
+		if (!this.persist || !this.sessionFile || this.flushed) return;
+		const destination = this.sessionFile;
+		if (existsSync(destination)) {
+			throw new Error(`Session file already exists before materialization: ${destination}`);
+		}
+		const temporary = `${destination}.materialize-${process.pid}-${randomUUID()}`;
+		let fd: number | undefined;
+		try {
+			fd = openSync(temporary, "wx", 0o600);
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+			fsyncSync(fd);
+			closeSync(fd);
+			fd = undefined;
+			// link is an atomic no-clobber publication on the same filesystem.
+			linkSync(temporary, destination);
+			unlinkSync(temporary);
+			this.flushed = true;
+		} catch (error) {
+			if (fd !== undefined) closeSync(fd);
+			if (existsSync(temporary)) unlinkSync(temporary);
+			throw error;
 		}
 	}
 
@@ -1018,7 +1229,10 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				const sessionFile = this.sessionFile;
+				withSessionFileLock(sessionFile, () => {
+					appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+				});
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1037,7 +1251,10 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			const sessionFile = this.sessionFile;
+			withSessionFileLock(sessionFile, () => {
+				appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+			});
 		}
 	}
 
@@ -1132,32 +1349,134 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Append a session info entry (e.g., display name). Returns entry id. */
-	appendSessionInfo(name: string): string {
+	private _refreshSessionNameMetadata(entry: SessionInfoEntry | undefined): void {
+		if (!entry) return;
+		const existing = this.byId.get(entry.id);
+		if (existing) {
+			if (
+				existing.type !== "session_info" ||
+				existing.name !== entry.name ||
+				existing.origin !== entry.origin ||
+				existing.parentId !== entry.parentId
+			) {
+				throw new Error(`Conflicting session entry ID during name refresh: ${entry.id}`);
+			}
+			return;
+		}
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+	}
+
+	private _appendSessionInfo(
+		name: string,
+		options: SessionNameWriteOptions,
+		expectedState?: SessionNameState,
+	): SessionNameWriteResult {
 		const sanitizedName = name.replace(/[\r\n]+/g, " ").trim();
-		const entry: SessionInfoEntry = {
-			type: "session_info",
-			id: generateId(this.byId),
-			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
-			name: sanitizedName,
+		const appendToCurrentState = (): SessionNameWriteResult => {
+			const currentState = this.getSessionNameState();
+			if (
+				expectedState &&
+				(currentState.entryId !== expectedState.entryId || currentState.name !== expectedState.name)
+			) {
+				return { written: false, currentState };
+			}
+			const entry: SessionInfoEntry = {
+				type: "session_info",
+				id: generateId(this.byId),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+				name: sanitizedName,
+				...(options.origin ? { origin: options.origin } : {}),
+			};
+			this.fileEntries.push(entry);
+			this.byId.set(entry.id, entry);
+			this._persist(entry);
+			return { written: true, entryId: entry.id };
 		};
-		this._appendEntry(entry);
-		return entry.id;
+
+		if (!this.persist || !this.sessionFile || !existsSync(this.sessionFile)) {
+			return appendToCurrentState();
+		}
+
+		const sessionFile = this.sessionFile;
+		return withSessionFileLock(sessionFile, () => {
+			const physical = scanSessionForNameTransaction(sessionFile);
+			if (physical.header.id !== this.sessionId) {
+				throw new Error(`Session file changed while acquiring name lock: ${this.sessionFile}`);
+			}
+
+			// The scan is authoritative only for name metadata. Never replace the live
+			// conversation snapshot: a message writer can append after this scan, and
+			// replacing fileEntries would make the naming manager forget live state.
+			const physicalNameEntry = physical.latestSessionInfo;
+			const currentState: SessionNameState = physicalNameEntry
+				? { name: physicalNameEntry.name?.trim() || undefined, entryId: physicalNameEntry.id }
+				: { name: undefined, entryId: undefined };
+			this._refreshSessionNameMetadata(physicalNameEntry);
+			if (
+				expectedState &&
+				(currentState.entryId !== expectedState.entryId || currentState.name !== expectedState.name)
+			) {
+				return { written: false, currentState };
+			}
+
+			const occupiedIds = new Set([...this.byId.keys(), ...physical.occupiedIds]);
+			const entry: SessionInfoEntry = {
+				type: "session_info",
+				id: generateId(occupiedIds),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+				name: sanitizedName,
+				...(options.origin ? { origin: options.origin } : {}),
+			};
+			const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+			const fd = openSync(sessionFile, "a");
+			try {
+				writeFileSync(fd, line);
+			} finally {
+				closeSync(fd);
+			}
+
+			this.fileEntries.push(entry);
+			this.byId.set(entry.id, entry);
+			return { written: true, entryId: entry.id };
+		});
+	}
+
+	/**
+	 * Append a session name unconditionally. File-backed writers coordinate through
+	 * one lock so a later human write remains canonical. Origin defaults to human.
+	 * Returns the new entry id.
+	 */
+	appendSessionInfo(name: string, options: SessionNameWriteOptions = {}): string {
+		const result = this._appendSessionInfo(name, { origin: options.origin ?? "human" });
+		if (!result.written) {
+			throw new Error("Unconditional session name write was not written");
+		}
+		return result.entryId;
+	}
+
+	/** Append a session name only when the latest physical name revision exactly matches. */
+	appendSessionInfoIfCurrent(
+		name: string,
+		expectedState: SessionNameState,
+		options: SessionNameWriteOptions = {},
+	): SessionNameWriteResult {
+		return this._appendSessionInfo(name, options, expectedState);
+	}
+
+	/** Get the latest name and its exact session_info revision, including explicit clears. */
+	getSessionNameState(): SessionNameState {
+		const entry = getLatestSessionInfoEntry(this.fileEntries);
+		return entry
+			? { name: entry.name?.trim() || undefined, entryId: entry.id }
+			: { name: undefined, entryId: undefined };
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		return this.getSessionNameState().name;
 	}
 
 	/**
@@ -1352,14 +1671,18 @@ export class SessionManager {
 	// =========================================================================
 
 	/**
-	 * Start a new branch from an earlier entry.
+	 * Start a new branch from an earlier conversation entry.
 	 * Moves the leaf pointer to the specified entry. The next appendXXX() call
 	 * will create a child of that entry, forming a new branch. Existing entries
-	 * are not modified or deleted.
+	 * are not modified or deleted. Session metadata cannot be a branch target.
 	 */
 	branch(branchFromId: string): void {
-		if (!this.byId.has(branchFromId)) {
+		const branchFrom = this.byId.get(branchFromId);
+		if (!branchFrom) {
 			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		if (branchFrom.type === "session_info") {
+			throw new Error("Session metadata cannot be selected as a branch target");
 		}
 		this.leafId = branchFromId;
 	}
@@ -1375,8 +1698,8 @@ export class SessionManager {
 
 	/**
 	 * Start a new branch with a summary of the abandoned path.
-	 * Same as branch(), but also appends a branch_summary entry that captures
-	 * context from the abandoned conversation path.
+	 * Same as branch(), including rejection of session metadata targets, but also
+	 * appends a branch_summary entry that captures context from the abandoned path.
 	 */
 	branchWithSummary(
 		branchFromId: string | null,
@@ -1385,8 +1708,14 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
-		if (branchFromId !== null && !this.byId.has(branchFromId)) {
-			throw new Error(`Entry ${branchFromId} not found`);
+		if (branchFromId !== null) {
+			const branchFrom = this.byId.get(branchFromId);
+			if (!branchFrom) {
+				throw new Error(`Entry ${branchFromId} not found`);
+			}
+			if (branchFrom.type === "session_info") {
+				throw new Error("Session metadata cannot be selected as a branch target");
+			}
 		}
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {

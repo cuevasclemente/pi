@@ -883,7 +883,7 @@ pi.on("user_bash", (event, ctx) => {
 
 #### input
 
-Fired when user input is received, after extension commands are checked but before skill and template expansion. The event sees the raw input text, so `/skill:foo` and `/template` are not yet expanded.
+Fired when user input is received, after extension commands are checked but before skill and template expansion. `event.originalText` is the immutable raw input received before any input handler. `event.text` is the current text and includes transforms returned by earlier input handlers. Neither field includes later `/skill:foo` or `/template` expansion.
 
 **Processing order:**
 1. Extension commands (`/cmd`) checked first - if found, handler runs and input event is skipped
@@ -894,8 +894,9 @@ Fired when user input is received, after extension commands are checked but befo
 
 ```typescript
 pi.on("input", async (event, ctx) => {
-  // event.text - raw input (before skill/template expansion)
-  // event.images - attached images, if any
+  // event.originalText - immutable raw input before every input handler
+  // event.text - current input after transforms from earlier handlers
+  // event.images - current attached images, including earlier replacements
   // event.source - "interactive" (typed), "rpc" (API), or "extension" (via sendUserMessage)
   // event.streamingBehavior - "steer" | "followUp" | undefined
   //   undefined when idle, "steer" for mid-stream interrupts,
