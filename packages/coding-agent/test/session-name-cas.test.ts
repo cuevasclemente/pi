@@ -1,6 +1,7 @@
 import {
 	appendFileSync,
 	closeSync,
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
@@ -99,6 +100,27 @@ describe("SessionManager session name transactions", () => {
 		} finally {
 			lockSpy.mockRestore();
 		}
+	});
+
+	it("materializes a new session without changing its identity or losing buffered entries", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-session-materialize-"));
+		tempDirs.push(dir);
+		const manager = SessionManager.create(dir, dir, { id: "materialized-session" });
+		const file = manager.getSessionFile();
+		expect(file).toBeDefined();
+		expect(existsSync(file!)).toBe(false);
+		manager.appendCustomEntry("buffered", { retained: true });
+
+		manager.materialize();
+
+		expect(existsSync(file!)).toBe(true);
+		expect(SessionManager.open(file!).getSessionId()).toBe("materialized-session");
+		expect(
+			SessionManager.open(file!)
+				.getEntries()
+				.some((entry) => entry.type === "custom"),
+		).toBe(true);
+		expect(() => manager.materialize()).not.toThrow();
 	});
 
 	it("publishes legacy migration rewrites by atomic replacement", () => {

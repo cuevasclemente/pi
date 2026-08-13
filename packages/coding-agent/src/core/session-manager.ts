@@ -8,6 +8,7 @@ import {
 	existsSync,
 	fstatSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -1159,6 +1160,38 @@ export class SessionManager {
 			closeSync(fd);
 			fd = undefined;
 			renameSync(temporary, destination);
+		} catch (error) {
+			if (fd !== undefined) closeSync(fd);
+			if (existsSync(temporary)) unlinkSync(temporary);
+			throw error;
+		}
+	}
+
+	/**
+	 * Atomically publish a newly-created session before another component stores
+	 * its proposed path as durable identity. Existing sessions are already
+	 * materialized; an unexpected path collision fails closed.
+	 */
+	materialize(): void {
+		if (!this.persist || !this.sessionFile || this.flushed) return;
+		const destination = this.sessionFile;
+		if (existsSync(destination)) {
+			throw new Error(`Session file already exists before materialization: ${destination}`);
+		}
+		const temporary = `${destination}.materialize-${process.pid}-${randomUUID()}`;
+		let fd: number | undefined;
+		try {
+			fd = openSync(temporary, "wx", 0o600);
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+			fsyncSync(fd);
+			closeSync(fd);
+			fd = undefined;
+			// link is an atomic no-clobber publication on the same filesystem.
+			linkSync(temporary, destination);
+			unlinkSync(temporary);
+			this.flushed = true;
 		} catch (error) {
 			if (fd !== undefined) closeSync(fd);
 			if (existsSync(temporary)) unlinkSync(temporary);
