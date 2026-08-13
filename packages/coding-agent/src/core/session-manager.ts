@@ -7,11 +7,14 @@ import {
 	createReadStream,
 	existsSync,
 	fstatSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -1144,13 +1147,22 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		const destination = this.sessionFile;
+		const temporary = `${destination}.rewrite-${process.pid}-${randomUUID()}`;
+		let fd: number | undefined;
 		try {
+			fd = openSync(temporary, "wx", 0o600);
 			for (const entry of this.fileEntries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
-		} finally {
+			fsyncSync(fd);
 			closeSync(fd);
+			fd = undefined;
+			renameSync(temporary, destination);
+		} catch (error) {
+			if (fd !== undefined) closeSync(fd);
+			if (existsSync(temporary)) unlinkSync(temporary);
+			throw error;
 		}
 	}
 
@@ -1184,7 +1196,10 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				const sessionFile = this.sessionFile;
+				withSessionFileLock(sessionFile, () => {
+					appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+				});
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1203,7 +1218,10 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			const sessionFile = this.sessionFile;
+			withSessionFileLock(sessionFile, () => {
+				appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+			});
 		}
 	}
 

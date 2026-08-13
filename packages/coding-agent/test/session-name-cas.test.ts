@@ -18,6 +18,7 @@ import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	parseSessionEntries,
+	type SessionHeader,
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionNameState,
@@ -98,6 +99,20 @@ describe("SessionManager session name transactions", () => {
 		} finally {
 			lockSpy.mockRestore();
 		}
+	});
+
+	it("publishes legacy migration rewrites by atomic replacement", () => {
+		const file = createSessionFile([messageEntry("legacy-message", null, "legacy")]);
+		const legacyEntries = parseSessionEntries(readFileSync(file, "utf8"));
+		(legacyEntries[0] as SessionHeader).version = 2;
+		writeFileSync(file, `${legacyEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const before = statSync(file);
+
+		SessionManager.open(file);
+
+		const after = statSync(file);
+		expect(after.ino).not.toBe(before.ino);
+		expect((parseSessionEntries(readFileSync(file, "utf8"))[0] as SessionHeader).version).toBe(3);
 	});
 
 	it("conditionally writes only when the exact physical name revision matches", () => {

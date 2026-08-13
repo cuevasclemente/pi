@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added coordinated, non-structural session-name metadata with optional human/automatic provenance and exact-revision compare-and-set writes. File-backed naming and existing-session migration rewrites share one lock so stale migration snapshots cannot erase concurrent names; naming strictly streams sessions of any size, and session metadata cannot be selected as a new branch target.
+- Added coordinated, non-structural session-name metadata with optional human/automatic provenance and exact-revision compare-and-set writes. File-backed appends and atomic existing-session migration rewrites share one lock so stale migration snapshots cannot erase concurrent entries; naming strictly streams sessions of any size, and session metadata cannot be selected as a new branch target.
 - Added immutable `InputEvent.originalText` so extensions can distinguish raw input from `event.text` transformed by earlier input handlers.
 
 ## [0.84.1] - 2026-08-07
