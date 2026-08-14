@@ -66,13 +66,17 @@ describe("Input Event", () => {
 		});
 	});
 
-	it("chains transforms across multiple handlers", async () => {
+	it("chains transforms while preserving immutable original text for every handler", async () => {
 		const r = await createRunner(
 			`export default p => p.on("input", async e => ({ action: "transform", text: e.text + "[1]" }));`,
-			`export default p => p.on("input", async e => ({ action: "transform", text: e.text + "[2]" }));`,
+			`export default p => p.on("input", async e => {
+				globalThis.testVar = { text: e.text, originalText: e.originalText };
+				return { action: "transform", text: e.text + "[2]" };
+			});`,
 		);
 		const result = await r.emitInput("X", undefined, "interactive");
 		expect(result).toEqual({ action: "transform", text: "X[1][2]", images: undefined });
+		expect((globalThis as any).testVar).toEqual({ text: "X[1]", originalText: "X" });
 	});
 
 	it("short-circuits on handled and skips subsequent handlers", async () => {
