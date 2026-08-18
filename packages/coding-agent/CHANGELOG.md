@@ -11,6 +11,7 @@
 - Added `--use-theme <name[/name]>` to choose an initial per-run interactive theme without changing saved settings ([#7722](https://github.com/earendil-works/pi/pull/7722) by [@rwachtler](https://github.com/rwachtler)).
 - Added coordinated, non-structural session-name metadata with optional human/automatic provenance and exact-revision compare-and-set writes. Transcript loads, final-record validation, and name scans run outside short, revision-validated append and atomic migration transactions so stale migration snapshots cannot erase concurrent entries or hold live locks during long scans; multiply linked sessions fail closed while known materialization aliases are reconciled; new sessions can be durably materialized with post-link crash reconciliation; stable canonical source snapshots are used for forks; naming strictly streams sessions of any size, and session metadata cannot be selected as a new branch target.
 - Added immutable `InputEvent.originalText` so extensions can distinguish raw input from `event.text` transformed by earlier input handlers.
+- Added `SessionManager.replaceEntryIfCurrent()` for strict, exact-revision event replacement using the existing session lock and atomic physical-file transaction while preserving header and tree topology.
 
 ### Changed
 

@@ -18,8 +18,10 @@ import {
 	readSync,
 	realpathSync,
 	renameSync,
+	rmdirSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -27,6 +29,7 @@ import { basename, dirname, join, parse, resolve } from "path";
 import lockfile from "proper-lockfile";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
+import { isDeepStrictEqual } from "util";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { canonicalizePath, normalizePath, resolvePath } from "../utils/paths.ts";
 import {
@@ -183,6 +186,14 @@ export type SessionEntry =
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
 
+export interface SessionEntryReplacement<
+	TExpected extends SessionEntryBase = SessionEntryBase,
+	TReplacement extends SessionEntryBase = SessionEntryBase,
+> {
+	expectedEntry: TExpected;
+	replacement: TReplacement;
+}
+
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeNode {
 	entry: SessionEntry;
@@ -236,6 +247,18 @@ export type ReadonlySessionManager = Pick<
 
 function createSessionId(): string {
 	return uuidv7();
+}
+
+function normalizeJsonObject<T extends object>(value: T, description: string): T {
+	try {
+		const serialized = JSON.stringify(value);
+		if (serialized === undefined) throw new Error("not serializable");
+		const parsed = JSON.parse(serialized) as unknown;
+		if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
+		return parsed as T;
+	} catch (error) {
+		throw new Error(`${description} must be JSON serializable`, { cause: error });
+	}
 }
 
 export function assertValidSessionId(id: string): void {
@@ -543,6 +566,13 @@ const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
 const SESSION_FILE_LOCK_STALE_MS = 5 * 60 * 1000;
 const SESSION_FILE_LOCK_RETRY_ATTEMPTS = 30;
 const SESSION_REVISION_RETRY_ATTEMPTS = 30;
+const SESSION_DESTRUCTIVE_LOCK_HEARTBEAT_MS = 30 * 1000;
+const SESSION_DESTRUCTIVE_LOCK_HEARTBEAT_BYTES = 8 * 1024 * 1024;
+/**
+ * Maximum physical input or canonical output for a synchronous destructive transaction.
+ * Larger Wayang sessions require an offline repair path rather than holding a synchronous lease.
+ */
+export const MAX_DESTRUCTIVE_TRANSACTION_BYTES = 256 * 1024 * 1024;
 
 function resolveMissingPathThroughExistingAncestor(filePath: string): string {
 	let ancestor = filePath;
@@ -647,12 +677,12 @@ function getStableSessionFileRevision(fd: number, sessionFile: string): SessionF
 	const pathStats = lstatSync(sessionFile, { bigint: true });
 	assertRegularSessionStats(descriptorStats, sessionFile);
 	assertRegularSessionStats(pathStats, sessionFile);
-	if (descriptorStats.nlink !== 1n || pathStats.nlink !== 1n) {
-		throw new Error(`Session file has multiple hard links and cannot be safely opened: ${sessionFile}`);
-	}
 	const descriptorRevision = revisionFromStats(descriptorStats);
 	if (!revisionsEqual(descriptorRevision, revisionFromStats(pathStats))) {
 		throw new SessionFileRevisionMismatchError(sessionFile);
+	}
+	if (descriptorStats.nlink !== 1n || pathStats.nlink !== 1n) {
+		throw new Error(`Session file has multiple hard links and cannot be safely opened: ${sessionFile}`);
 	}
 	return descriptorRevision;
 }
@@ -687,8 +717,38 @@ function fsyncParentDirectory(filePath: string): void {
 	}
 }
 
-function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
+interface SessionFileLockLease {
+	assertOwned(): void;
+	heartbeat(): void;
+}
+
+function withSessionFileLock<T>(sessionFile: string, operation: (lease: SessionFileLockLease) => T): T {
 	let release: (() => void) | undefined;
+	let expectedLockIdentity: Pick<SessionFileRevision, "dev" | "ino"> | undefined;
+	const lockFs = {
+		mkdirSync,
+		realpathSync,
+		statSync,
+		utimesSync,
+		rmdirSync: (lockDirectory: string): void => {
+			if (expectedLockIdentity) {
+				let currentStats: BigIntStats;
+				try {
+					currentStats = lstatSync(lockDirectory, { bigint: true });
+				} catch (error) {
+					throw new Error(`Refusing to remove an unverified session lock: ${lockDirectory}`, { cause: error });
+				}
+				if (
+					!currentStats.isDirectory() ||
+					currentStats.dev !== expectedLockIdentity.dev ||
+					currentStats.ino !== expectedLockIdentity.ino
+				) {
+					throw new Error(`Refusing to remove a successor session lock: ${lockDirectory}`);
+				}
+			}
+			rmdirSync(lockDirectory);
+		},
+	};
 	const lockWaitArray = new Int32Array(new SharedArrayBuffer(4));
 	for (let attempt = 0; attempt <= SESSION_FILE_LOCK_RETRY_ATTEMPTS; attempt++) {
 		try {
@@ -696,6 +756,7 @@ function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
 				stale: SESSION_FILE_LOCK_STALE_MS,
 				update: SESSION_FILE_LOCK_STALE_MS / 2,
 				retries: 0,
+				fs: lockFs,
 			});
 			break;
 		} catch (error) {
@@ -706,11 +767,62 @@ function withSessionFileLock<T>(sessionFile: string, operation: () => T): T {
 		}
 	}
 	if (!release) throw new Error(`Failed to acquire session file lock: ${sessionFile}`);
+	const lockPath = `${sessionFile}.lock`;
+	let acquiredStats: BigIntStats;
 	try {
-		return operation();
+		acquiredStats = lstatSync(lockPath, { bigint: true });
+		if (!acquiredStats.isDirectory()) throw new Error(`Session lock path is not a directory: ${lockPath}`);
+		expectedLockIdentity = { dev: acquiredStats.dev, ino: acquiredStats.ino };
+	} catch (error) {
+		release();
+		throw error;
+	}
+	const lease: SessionFileLockLease = {
+		assertOwned: () => {
+			let currentStats: BigIntStats;
+			try {
+				currentStats = lstatSync(lockPath, { bigint: true });
+			} catch (error) {
+				throw new Error(`Session file lock ownership was lost: ${sessionFile}`, { cause: error });
+			}
+			if (
+				!currentStats.isDirectory() ||
+				currentStats.dev !== acquiredStats.dev ||
+				currentStats.ino !== acquiredStats.ino
+			) {
+				throw new Error(`Session file lock ownership was lost: ${sessionFile}`);
+			}
+		},
+		heartbeat: () => {
+			lease.assertOwned();
+			const now = new Date();
+			utimesSync(lockPath, now, now);
+			lease.assertOwned();
+		},
+	};
+	try {
+		return operation(lease);
 	} finally {
 		release();
 	}
+}
+
+function createDestructiveHeartbeat(lease: SessionFileLockLease): (processedBytes: number) => void {
+	let bytesSinceHeartbeat = 0;
+	let lastHeartbeat = Date.now();
+	return (processedBytes: number): void => {
+		bytesSinceHeartbeat += processedBytes;
+		const now = Date.now();
+		if (
+			bytesSinceHeartbeat < SESSION_DESTRUCTIVE_LOCK_HEARTBEAT_BYTES &&
+			now - lastHeartbeat < SESSION_DESTRUCTIVE_LOCK_HEARTBEAT_MS
+		) {
+			return;
+		}
+		lease.heartbeat();
+		bytesSinceHeartbeat = 0;
+		lastHeartbeat = now;
+	};
 }
 
 function appendLineAtRevision(
@@ -947,6 +1059,114 @@ interface SessionNameTransactionScan {
 	latestSessionInfo: SessionInfoEntry | undefined;
 	occupiedIds: Set<string>;
 	revision: SessionFileRevision;
+}
+
+interface SessionEntryReplacementScan {
+	header: SessionHeader;
+	entries: FileEntry[];
+	byId: Map<string, SessionEntry>;
+	revision: SessionFileRevision;
+}
+
+/** Strict physical scan used only by destructive entry replacement. The caller owns fd. */
+function scanOpenSessionForEntryReplacement(
+	fd: number,
+	filePath: string,
+	heartbeat: (processedBytes: number) => void,
+): SessionEntryReplacementScan {
+	const initialRevision = getStableSessionFileRevision(fd, filePath);
+	if (initialRevision.size === 0n) throw new Error(`Session file is empty: ${filePath}`);
+	if (initialRevision.size > BigInt(MAX_DESTRUCTIVE_TRANSACTION_BYTES)) {
+		throw new Error(`Session file exceeds the 256 MiB destructive transaction limit: ${filePath}`);
+	}
+	const initialSize = Number(initialRevision.size);
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+	const entries: FileEntry[] = [];
+	const byId = new Map<string, SessionEntry>();
+	let header: SessionHeader | undefined;
+	let pending = "";
+	let offset = 0;
+
+	const hasValidTimestamp = (value: unknown): value is string =>
+		typeof value === "string" && value.length > 0 && !Number.isNaN(Date.parse(value));
+	const processLine = (line: string): void => {
+		if (!line.trim()) throw new Error(`Session file has a blank JSONL entry: ${filePath}`);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			throw new Error(`Session file has a malformed JSONL entry: ${filePath}`);
+		}
+		if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) {
+			throw new Error(`Session file has a non-object JSONL entry: ${filePath}`);
+		}
+		const entry = parsed as FileEntry;
+		if (!header) {
+			const candidateHeader = entry as Partial<SessionHeader>;
+			if (
+				candidateHeader.type !== "session" ||
+				typeof candidateHeader.id !== "string" ||
+				!candidateHeader.id ||
+				!hasValidTimestamp(candidateHeader.timestamp) ||
+				typeof candidateHeader.cwd !== "string" ||
+				(candidateHeader.version !== undefined && typeof candidateHeader.version !== "number") ||
+				(candidateHeader.parentSession !== undefined && typeof candidateHeader.parentSession !== "string")
+			) {
+				throw new Error(`Session file is not a valid pi session: ${filePath}`);
+			}
+			header = entry as SessionHeader;
+			entries.push(header);
+			return;
+		}
+		if (entry.type === "session") throw new Error(`Session file has multiple headers: ${filePath}`);
+		const candidate = entry as Partial<SessionEntryBase>;
+		if (
+			typeof candidate.type !== "string" ||
+			!candidate.type ||
+			typeof candidate.id !== "string" ||
+			!candidate.id ||
+			!hasValidTimestamp(candidate.timestamp) ||
+			(candidate.parentId !== null && (typeof candidate.parentId !== "string" || !candidate.parentId))
+		) {
+			throw new Error(`Session file has a malformed session entry: ${filePath}`);
+		}
+		if (byId.has(candidate.id)) {
+			throw new Error(`Session file has duplicate entry ID ${candidate.id}: ${filePath}`);
+		}
+		const sessionEntry = entry as SessionEntry;
+		entries.push(sessionEntry);
+		byId.set(sessionEntry.id, sessionEntry);
+	};
+
+	try {
+		while (offset < initialSize) {
+			const readLength = Math.min(buffer.length, initialSize - offset);
+			const bytesRead = readSync(fd, buffer, 0, readLength, offset);
+			if (bytesRead === 0) throw new SessionFileRevisionMismatchError(filePath);
+			offset += bytesRead;
+			pending += decoder.decode(buffer.subarray(0, bytesRead), { stream: true });
+			let newlineIndex = pending.indexOf("\n");
+			while (newlineIndex !== -1) {
+				processLine(pending.slice(0, newlineIndex));
+				pending = pending.slice(newlineIndex + 1);
+				newlineIndex = pending.indexOf("\n");
+			}
+			heartbeat(bytesRead);
+		}
+		pending += decoder.decode();
+	} catch (error) {
+		if (error instanceof TypeError) {
+			throw new Error(`Session file contains invalid UTF-8: ${filePath}`, { cause: error });
+		}
+		throw error;
+	}
+	if (!revisionsEqual(getStableSessionFileRevision(fd, filePath), initialRevision)) {
+		throw new SessionFileRevisionMismatchError(filePath);
+	}
+	if (pending.length > 0) throw new Error(`Session file has an unterminated JSONL tail: ${filePath}`);
+	if (!header) throw new Error(`Session file is not a valid pi session: ${filePath}`);
+	return { header, entries, byId, revision: initialRevision };
 }
 
 /** Strict streaming name scan performed before the short commit lock. */
@@ -1446,8 +1666,37 @@ function reconcileMaterializeAliasesBeforeOpen(destination: string): void {
 	}
 }
 
+function cleanupRewriteTempsUnderLock(destination: string): void {
+	const prefix = `${basename(destination)}.rewrite-`;
+	let removed = false;
+	for (const name of readdirSync(dirname(destination))) {
+		if (!name.startsWith(prefix)) continue;
+		const candidate = join(dirname(destination), name);
+		try {
+			if (!lstatSync(candidate).isFile()) continue;
+			unlinkSync(candidate);
+			removed = true;
+		} catch (error) {
+			if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) {
+				throw error;
+			}
+		}
+	}
+	if (removed) fsyncParentDirectory(destination);
+}
+
+/** Best-effort cleanup of new-content rewrite temps left by a crashed transaction. */
+function reconcileRewriteTempsBeforeOpen(destination: string): void {
+	try {
+		withSessionFileLock(destination, () => cleanupRewriteTempsUnderLock(destination));
+	} catch {
+		// Opening remains possible; stable file validation follows immediately.
+	}
+}
+
 /**
- * Manages conversation sessions as append-only trees stored in JSONL files.
+ * Manages conversation sessions as trees stored in JSONL files. Entries are
+ * normally appended; replaceEntriesIfCurrent provides the guarded canonical rewrite.
  *
  * Each session entry has an id and parentId forming a tree structure. The "leaf"
  * pointer tracks the current position. Appending creates a child of the current leaf.
@@ -1514,6 +1763,7 @@ export class SessionManager {
 			this.sessionFile = resolveSessionFileIdentity(sessionFile);
 			if (existsSync(this.sessionFile)) {
 				reconcileMaterializeAliasesBeforeOpen(this.sessionFile);
+				reconcileRewriteTempsBeforeOpen(this.sessionFile);
 				const explicitPath = this.sessionFile;
 				let loadedEntries: FileEntry[] | undefined;
 				for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
@@ -1631,46 +1881,63 @@ export class SessionManager {
 	): void {
 		if (!this.persist || !this.sessionFile) return;
 		const destination = this.sessionFile;
-		const temporary = `${destination}.rewrite-${process.pid}-${randomUUID()}`;
-		let fd: number | undefined;
-		let replaced = false;
-		try {
-			// Serialize and fsync the replacement before acquiring the commit lock.
-			fd = openSync(temporary, "wx", 0o600);
-			for (const entry of entries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
-			fsyncSync(fd);
-			closeSync(fd);
-			fd = undefined;
-
-			const publish = (): void => {
-				if (expectedRevision || existsSync(destination)) {
-					const currentFd = openSync(destination, "r");
-					try {
-						if (expectedRevision) assertSessionFileRevision(currentFd, destination, expectedRevision);
-						assertSessionFileCanBeReplaced(currentFd, destination);
-					} finally {
-						closeSync(currentFd);
+		const rewrite = (lease?: SessionFileLockLease): void => {
+			if (expectedRevision && !lease) throw new Error("Revision rewrite requires a held session file lock");
+			if (expectedRevision) cleanupRewriteTempsUnderLock(destination);
+			const heartbeat = lease ? createDestructiveHeartbeat(lease) : undefined;
+			const temporary = `${destination}.rewrite-${process.pid}-${randomUUID()}`;
+			let fd: number | undefined;
+			let currentFd: number | undefined;
+			let replaced = false;
+			try {
+				if (expectedRevision) {
+					currentFd = openSync(destination, "r");
+					assertSessionFileRevision(currentFd, destination, expectedRevision);
+					assertSessionFileCanBeReplaced(currentFd, destination);
+				}
+				fd = openSync(temporary, "wx", 0o600);
+				let outputBytes = 0;
+				for (const entry of entries) {
+					const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+					outputBytes += line.length;
+					if (expectedRevision && outputBytes > MAX_DESTRUCTIVE_TRANSACTION_BYTES) {
+						throw new Error(`Rewrite exceeds the 256 MiB destructive transaction limit: ${destination}`);
 					}
+					for (let offset = 0; offset < line.length; offset += SESSION_READ_BUFFER_SIZE) {
+						const chunk = line.subarray(offset, Math.min(line.length, offset + SESSION_READ_BUFFER_SIZE));
+						writeFileSync(fd, chunk);
+						heartbeat?.(chunk.length);
+					}
+				}
+				lease?.heartbeat();
+				fsyncSync(fd);
+				lease?.heartbeat();
+				closeSync(fd);
+				fd = undefined;
+
+				if (expectedRevision && currentFd !== undefined) {
+					assertSessionFileRevision(currentFd, destination, expectedRevision);
+					lease?.assertOwned();
+				} else if (existsSync(destination)) {
+					currentFd = openSync(destination, "r");
+					assertSessionFileCanBeReplaced(currentFd, destination);
 				}
 				renameSync(temporary, destination);
 				replaced = true;
 				fsyncParentDirectory(destination);
-			};
-			if (expectedRevision) {
-				withSessionFileLock(destination, publish);
-			} else {
-				publish();
+			} catch (error) {
+				if (fd !== undefined) closeSync(fd);
+				if (existsSync(temporary)) unlinkSync(temporary);
+				// renameSync already committed the replacement. Keep manager state aligned
+				// with that publication rather than reporting the whole transaction failed.
+				if (replaced && sessionFileMatchesEntries(destination, entries)) return;
+				throw error;
+			} finally {
+				if (currentFd !== undefined) closeSync(currentFd);
 			}
-		} catch (error) {
-			if (fd !== undefined) closeSync(fd);
-			if (existsSync(temporary)) unlinkSync(temporary);
-			// renameSync already committed the replacement. Keep manager state aligned
-			// with that publication rather than reporting the whole transaction failed.
-			if (replaced && sessionFileMatchesEntries(destination, entries)) return;
-			throw error;
-		}
+		};
+		if (expectedRevision) withSessionFileLock(destination, rewrite);
+		else rewrite();
 	}
 
 	/**
@@ -2038,6 +2305,245 @@ export class SessionManager {
 		return this.getSessionNameState().name;
 	}
 
+	/** Atomically replace one exact current entry. See replaceEntriesIfCurrent(). */
+	replaceEntryIfCurrent<TExpected extends SessionEntryBase, TReplacement extends SessionEntryBase>(
+		expectedEntry: TExpected,
+		replacement: TReplacement,
+	): boolean {
+		return this.replaceEntriesIfCurrent([{ expectedEntry, replacement }]);
+	}
+
+	/**
+	 * Atomically replace multiple exact current entries in one canonical rewrite.
+	 * Header, id, and parentId are immutable; event type and payload may change.
+	 * Returns false without writing when any expected physical entry is stale.
+	 *
+	 * Lock heartbeats protect cooperative writers using this canonical path. They
+	 * cannot contain hostile same-UID lock manipulation or suspension beyond the
+	 * lease stale interval. Crash durability after rename is conditional on the
+	 * platform/filesystem supporting directory fsync per fsyncParentDirectory().
+	 */
+	replaceEntriesIfCurrent<TChanges extends readonly SessionEntryReplacement[]>(changes: TChanges): boolean {
+		if (changes.length === 0) throw new Error("At least one session entry replacement is required");
+		const targetIds = new Set<string>();
+		const normalizedChanges = changes.map(({ expectedEntry, replacement }) => {
+			const assertEnvelope = (entry: SessionEntryBase, description: string): void => {
+				if (entry.type === "session") throw new Error(`${description} cannot be a session header`);
+				if (
+					typeof entry.type !== "string" ||
+					!entry.type ||
+					typeof entry.id !== "string" ||
+					!entry.id ||
+					(entry.parentId !== null && (typeof entry.parentId !== "string" || !entry.parentId)) ||
+					typeof entry.timestamp !== "string" ||
+					!entry.timestamp ||
+					Number.isNaN(Date.parse(entry.timestamp))
+				) {
+					throw new Error(`${description} has an invalid session entry envelope`);
+				}
+			};
+			assertEnvelope(expectedEntry, "Expected session entry");
+			assertEnvelope(replacement, "Replacement session entry");
+			if (targetIds.has(expectedEntry.id)) {
+				throw new Error(`Session entry ${expectedEntry.id} is replaced more than once`);
+			}
+			targetIds.add(expectedEntry.id);
+			if (replacement.id !== expectedEntry.id) {
+				throw new Error("Session entry ID is immutable during replacement");
+			}
+			if (replacement.parentId !== expectedEntry.parentId) {
+				throw new Error("Session entry parentId is immutable during replacement");
+			}
+			const normalizedExpected = normalizeJsonObject(expectedEntry, "Expected session entry");
+			const normalizedReplacement = normalizeJsonObject(replacement, "Replacement session entry");
+			assertEnvelope(normalizedExpected, "Normalized expected session entry");
+			assertEnvelope(normalizedReplacement, "Normalized replacement session entry");
+			if (
+				normalizedExpected.id !== expectedEntry.id ||
+				normalizedExpected.parentId !== expectedEntry.parentId ||
+				normalizedReplacement.id !== expectedEntry.id ||
+				normalizedReplacement.parentId !== expectedEntry.parentId
+			) {
+				throw new Error("Session entry changed immutable fields during serialization");
+			}
+			return {
+				expectedEntry: normalizedExpected,
+				replacement: normalizedReplacement as SessionEntry,
+			};
+		});
+
+		const selectedLeafId = this.leafId;
+		const applyManagerState = (entries: FileEntry[]): void => {
+			const previous = {
+				fileEntries: this.fileEntries,
+				byId: this.byId,
+				labelsById: this.labelsById,
+				labelTimestampsById: this.labelTimestampsById,
+				leafId: this.leafId,
+				flushed: this.flushed,
+			};
+			try {
+				this.fileEntries = entries;
+				this._buildIndex();
+				this.leafId = selectedLeafId;
+				this.flushed = this.persist ? true : previous.flushed;
+			} catch (error) {
+				this.fileEntries = previous.fileEntries;
+				this.byId = previous.byId;
+				this.labelsById = previous.labelsById;
+				this.labelTimestampsById = previous.labelTimestampsById;
+				this.leafId = previous.leafId;
+				this.flushed = previous.flushed;
+				throw error;
+			}
+		};
+
+		if (!this.persist) {
+			for (const change of normalizedChanges) {
+				const current = this.byId.get(change.expectedEntry.id);
+				if (
+					!current ||
+					!isDeepStrictEqual(normalizeJsonObject(current, "Current session entry"), change.expectedEntry)
+				) {
+					return false;
+				}
+			}
+			const replacementsById = new Map(
+				normalizedChanges.map((change) => [change.expectedEntry.id, change.replacement] as const),
+			);
+			applyManagerState(
+				this.fileEntries.map((entry) =>
+					entry.type === "session" ? entry : (replacementsById.get(entry.id) ?? entry),
+				),
+			);
+			return true;
+		}
+
+		if (!this.sessionFile || !existsSync(this.sessionFile)) {
+			throw new Error("Session file must be materialized before entry replacement");
+		}
+		const sessionFile = this.sessionFile;
+		return withSessionFileLock(sessionFile, (lease) => {
+			cleanupRewriteTempsUnderLock(sessionFile);
+			const heartbeat = createDestructiveHeartbeat(lease);
+			const temporary = `${sessionFile}.rewrite-${process.pid}-${randomUUID()}`;
+			let canonicalFd: number | undefined;
+			let temporaryFd: number | undefined;
+			let committed = false;
+			let stateApplied = false;
+			let committedEntries: FileEntry[] | undefined;
+			try {
+				canonicalFd = openSync(sessionFile, "r");
+				const physical = scanOpenSessionForEntryReplacement(canonicalFd, sessionFile, heartbeat);
+				const loadedHeader = this.getHeader();
+				if (
+					!loadedHeader ||
+					physical.header.id !== this.sessionId ||
+					!isDeepStrictEqual(physical.header, normalizeJsonObject(loadedHeader, "Loaded session header"))
+				) {
+					throw new Error(`Session header changed during entry replacement: ${sessionFile}`);
+				}
+				for (const change of normalizedChanges) {
+					const current = physical.byId.get(change.expectedEntry.id);
+					if (!current || !isDeepStrictEqual(current, change.expectedEntry)) return false;
+				}
+				if (selectedLeafId !== null && !physical.byId.has(selectedLeafId)) {
+					throw new Error(`Selected session leaf is missing from physical file: ${selectedLeafId}`);
+				}
+				const replacementsById = new Map(
+					normalizedChanges.map((change) => [change.expectedEntry.id, change.replacement] as const),
+				);
+				committedEntries = physical.entries.map((entry) =>
+					entry.type === "session" ? entry : (replacementsById.get(entry.id) ?? entry),
+				);
+				if (normalizedChanges.every((change) => isDeepStrictEqual(change.expectedEntry, change.replacement))) {
+					lease.assertOwned();
+					applyManagerState(committedEntries);
+					return true;
+				}
+
+				lease.heartbeat();
+				temporaryFd = openSync(temporary, "wx", 0o600);
+				let outputBytes = 0;
+				for (const entry of committedEntries) {
+					const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+					outputBytes += line.length;
+					if (outputBytes > MAX_DESTRUCTIVE_TRANSACTION_BYTES) {
+						throw new Error(`Replacement exceeds the 256 MiB destructive transaction limit: ${sessionFile}`);
+					}
+					for (let offset = 0; offset < line.length; offset += SESSION_READ_BUFFER_SIZE) {
+						const chunk = line.subarray(offset, Math.min(line.length, offset + SESSION_READ_BUFFER_SIZE));
+						writeFileSync(temporaryFd, chunk);
+						heartbeat(chunk.length);
+					}
+				}
+				lease.heartbeat();
+				fsyncSync(temporaryFd);
+				lease.heartbeat();
+				closeSync(temporaryFd);
+				temporaryFd = undefined;
+				assertSessionFileRevision(canonicalFd, sessionFile, physical.revision);
+				lease.assertOwned();
+				renameSync(temporary, sessionFile);
+				committed = true;
+				let postCommitError: unknown;
+				try {
+					fsyncParentDirectory(sessionFile);
+				} catch (error) {
+					postCommitError = error;
+				}
+				if (!sessionFileMatchesEntries(sessionFile, committedEntries)) {
+					postCommitError = new Error(`Committed session replacement could not be verified: ${sessionFile}`, {
+						cause: postCommitError,
+					});
+				}
+				applyManagerState(committedEntries);
+				stateApplied = true;
+				if (postCommitError) {
+					throw new Error(`Session replacement committed but post-commit durability failed: ${sessionFile}`, {
+						cause: postCommitError,
+					});
+				}
+				return true;
+			} catch (error) {
+				let cleanupError: unknown;
+				if (temporaryFd !== undefined) {
+					try {
+						closeSync(temporaryFd);
+					} catch (caught) {
+						cleanupError = caught;
+					}
+					temporaryFd = undefined;
+				}
+				if (existsSync(temporary)) {
+					try {
+						unlinkSync(temporary);
+					} catch (caught) {
+						cleanupError ??= caught;
+					}
+				}
+				if (committed && committedEntries && !stateApplied) {
+					applyManagerState(committedEntries);
+					stateApplied = true;
+				}
+				if (cleanupError) {
+					throw new Error(`Session replacement failed and temporary cleanup failed: ${temporary}`, {
+						cause: cleanupError,
+					});
+				}
+				if (committed) {
+					throw new Error(`Session replacement committed but reported a post-commit failure: ${sessionFile}`, {
+						cause: error,
+					});
+				}
+				throw error;
+			} finally {
+				if (temporaryFd !== undefined) closeSync(temporaryFd);
+				if (canonicalFd !== undefined) closeSync(canonicalFd);
+			}
+		});
+	}
+
 	/**
 	 * Append a custom message entry (for extensions) that participates in LLM context.
 	 * @param customType Extension identifier for filtering on reload
@@ -2173,8 +2679,8 @@ export class SessionManager {
 
 	/**
 	 * Get all session entries (excludes header). Returns a shallow copy.
-	 * The session is append-only: use appendXXX() to add entries, branch() to
-	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 * Use appendXXX() to add entries, branch() to change the leaf pointer, and
+	 * replaceEntriesIfCurrent() for exact guarded canonical replacements.
 	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
