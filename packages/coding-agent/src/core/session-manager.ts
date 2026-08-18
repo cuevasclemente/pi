@@ -49,6 +49,34 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/** System-owned canonical mutation generation. Legacy headers default to zero. */
+	mutationEpoch?: number;
+}
+
+export class SessionEntryReplacementCommittedError extends Error {
+	readonly committed: true = true;
+	readonly code: "ESESSIONREPLACEMENTCOMMITTED" = "ESESSIONREPLACEMENTCOMMITTED";
+
+	constructor(sessionFile: string, cause: unknown) {
+		super(`Session entry replacement committed but requires attention: ${sessionFile}`, { cause });
+		this.name = "SessionEntryReplacementCommittedError";
+	}
+}
+
+export class StaleSessionMutationEpochError extends Error {
+	readonly code: "ESTALESESSIONMUTATIONEPOCH" = "ESTALESESSIONMUTATIONEPOCH";
+	readonly loadedEpoch: number;
+	readonly physicalEpoch: number;
+
+	constructor(sessionFile: string, loadedEpoch: number, physicalEpoch: number) {
+		super(
+			`Session was canonically mutated and must be reopened before appending: ${sessionFile} ` +
+				`(loaded epoch ${loadedEpoch}, physical epoch ${physicalEpoch})`,
+		);
+		this.name = "StaleSessionMutationEpochError";
+		this.loadedEpoch = loadedEpoch;
+		this.physicalEpoch = physicalEpoch;
+	}
 }
 
 export interface NewSessionOptions {
@@ -247,6 +275,14 @@ export type ReadonlySessionManager = Pick<
 
 function createSessionId(): string {
 	return uuidv7();
+}
+
+function getSessionMutationEpoch(header: SessionHeader, filePath?: string): number {
+	const epoch = header.mutationEpoch ?? 0;
+	if (!Number.isSafeInteger(epoch) || epoch < 0) {
+		throw new Error(`Session header has an invalid mutation epoch${filePath ? `: ${filePath}` : ""}`);
+	}
+	return epoch;
 }
 
 function normalizeJsonObject<T extends object>(value: T, description: string): T {
@@ -844,9 +880,44 @@ function appendLineAtRevision(
 	});
 }
 
+function readPhysicalSessionHeader(fd: number, sessionFile: string, fileSize: number): SessionHeader {
+	const readLength = Math.min(fileSize, MAX_SESSION_HEADER_SCAN_BYTES);
+	const bytes = Buffer.allocUnsafe(readLength);
+	let offset = 0;
+	while (offset < readLength) {
+		const bytesRead = readSync(fd, bytes, offset, readLength - offset, offset);
+		if (bytesRead === 0) throw new SessionFileRevisionMismatchError(sessionFile);
+		offset += bytesRead;
+	}
+	const newlineIndex = bytes.indexOf(0x0a);
+	if (newlineIndex < 0) throw new Error(`Session file has no terminated header: ${sessionFile}`);
+	let decoded: string;
+	try {
+		decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, newlineIndex));
+	} catch (error) {
+		throw new Error(`Session header contains invalid UTF-8: ${sessionFile}`, { cause: error });
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(decoded);
+	} catch (error) {
+		throw new Error(`Session file has a malformed header: ${sessionFile}`, { cause: error });
+	}
+	if (typeof parsed !== "object" || parsed === null || !("type" in parsed) || parsed.type !== "session") {
+		throw new Error(`Session file is not a valid pi session: ${sessionFile}`);
+	}
+	const header = parsed as SessionHeader;
+	if (typeof header.id !== "string" || !header.id) {
+		throw new Error(`Session file has an invalid header ID: ${sessionFile}`);
+	}
+	getSessionMutationEpoch(header, sessionFile);
+	return header;
+}
+
 function prepareOrdinaryAppend(
 	sessionFile: string,
 	line: Buffer,
+	expectedMutationEpoch: number,
 ): {
 	revision: SessionFileRevision;
 	line: Buffer;
@@ -859,6 +930,10 @@ function prepareOrdinaryAppend(
 			throw new Error(`Session file is too large to append safely: ${sessionFile}`);
 		}
 		const size = Number(initialRevision.size);
+		const physicalMutationEpoch = getSessionMutationEpoch(readPhysicalSessionHeader(fd, sessionFile, size), sessionFile);
+		if (physicalMutationEpoch !== expectedMutationEpoch) {
+			throw new StaleSessionMutationEpochError(sessionFile, expectedMutationEpoch, physicalMutationEpoch);
+		}
 		const byte = Buffer.allocUnsafe(1);
 		if (readSync(fd, byte, 0, 1, size - 1) !== 1) throw new SessionFileRevisionMismatchError(sessionFile);
 		const terminated = byte[0] === 0x0a;
@@ -924,10 +999,10 @@ function prepareOrdinaryAppend(
 	}
 }
 
-function appendLineWithRevisionRetry(sessionFile: string, line: Buffer): void {
+function appendLineWithRevisionRetry(sessionFile: string, line: Buffer, expectedMutationEpoch: number): void {
 	for (let attempt = 0; attempt <= SESSION_REVISION_RETRY_ATTEMPTS; attempt++) {
 		try {
-			const prepared = prepareOrdinaryAppend(sessionFile, line);
+			const prepared = prepareOrdinaryAppend(sessionFile, line, expectedMutationEpoch);
 			appendLineAtRevision(sessionFile, prepared.revision, prepared.line);
 			return;
 		} catch (error) {
@@ -1116,6 +1191,7 @@ function scanOpenSessionForEntryReplacement(
 				throw new Error(`Session file is not a valid pi session: ${filePath}`);
 			}
 			header = entry as SessionHeader;
+			getSessionMutationEpoch(header, filePath);
 			entries.push(header);
 			return;
 		}
@@ -2039,11 +2115,18 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
+		const loadedHeader = this.getHeader();
+		if (!loadedHeader) throw new Error("Cannot persist a session entry without a loaded header");
+		const loadedMutationEpoch = getSessionMutationEpoch(loadedHeader);
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendLineWithRevisionRetry(this.sessionFile, Buffer.from(`${JSON.stringify(entry)}\n`));
+				appendLineWithRevisionRetry(
+					this.sessionFile,
+					Buffer.from(`${JSON.stringify(entry)}\n`),
+					loadedMutationEpoch,
+				);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -2054,7 +2137,11 @@ export class SessionManager {
 		if (!this.flushed) {
 			this.materialize();
 		} else {
-			appendLineWithRevisionRetry(this.sessionFile, Buffer.from(`${JSON.stringify(entry)}\n`));
+			appendLineWithRevisionRetry(
+				this.sessionFile,
+				Buffer.from(`${JSON.stringify(entry)}\n`),
+				loadedMutationEpoch,
+			);
 		}
 	}
 
@@ -2226,6 +2313,13 @@ export class SessionManager {
 				const physical = scanSessionForNameTransaction(sessionFile);
 				if (physical.header.id !== this.sessionId) {
 					throw new Error(`Session file changed during name transaction: ${this.sessionFile}`);
+				}
+				const loadedHeader = this.getHeader();
+				if (!loadedHeader) throw new Error("Cannot append session metadata without a loaded header");
+				const loadedMutationEpoch = getSessionMutationEpoch(loadedHeader);
+				const physicalMutationEpoch = getSessionMutationEpoch(physical.header, sessionFile);
+				if (physicalMutationEpoch !== loadedMutationEpoch) {
+					throw new StaleSessionMutationEpochError(sessionFile, loadedMutationEpoch, physicalMutationEpoch);
 				}
 
 				// The outside-lock scan is authoritative only after the short commit lock
@@ -2411,9 +2505,15 @@ export class SessionManager {
 			const replacementsById = new Map(
 				normalizedChanges.map((change) => [change.expectedEntry.id, change.replacement] as const),
 			);
+			const loadedHeader = this.getHeader();
+			if (!loadedHeader) throw new Error("Cannot replace session entries without a loaded header");
+			const nextMutationEpoch = getSessionMutationEpoch(loadedHeader) + 1;
+			if (!Number.isSafeInteger(nextMutationEpoch)) throw new Error("Session mutation epoch is exhausted");
 			applyManagerState(
 				this.fileEntries.map((entry) =>
-					entry.type === "session" ? entry : (replacementsById.get(entry.id) ?? entry),
+					entry.type === "session"
+						? { ...entry, mutationEpoch: nextMutationEpoch }
+						: (replacementsById.get(entry.id) ?? entry),
 				),
 			);
 			return true;
@@ -2423,7 +2523,9 @@ export class SessionManager {
 			throw new Error("Session file must be materialized before entry replacement");
 		}
 		const sessionFile = this.sessionFile;
-		return withSessionFileLock(sessionFile, (lease) => {
+		let replacementCommitted = false;
+		try {
+			return withSessionFileLock(sessionFile, (lease) => {
 			cleanupRewriteTempsUnderLock(sessionFile);
 			const heartbeat = createDestructiveHeartbeat(lease);
 			const temporary = `${sessionFile}.rewrite-${process.pid}-${randomUUID()}`;
@@ -2436,10 +2538,15 @@ export class SessionManager {
 				canonicalFd = openSync(sessionFile, "r");
 				const physical = scanOpenSessionForEntryReplacement(canonicalFd, sessionFile, heartbeat);
 				const loadedHeader = this.getHeader();
+				if (!loadedHeader) throw new Error("Cannot replace session entries without a loaded header");
+				const normalizedLoadedHeader = normalizeJsonObject(loadedHeader, "Loaded session header");
+				const loadedHeaderWithoutEpoch = { ...normalizedLoadedHeader };
+				const physicalHeaderWithoutEpoch = { ...physical.header };
+				delete loadedHeaderWithoutEpoch.mutationEpoch;
+				delete physicalHeaderWithoutEpoch.mutationEpoch;
 				if (
-					!loadedHeader ||
 					physical.header.id !== this.sessionId ||
-					!isDeepStrictEqual(physical.header, normalizeJsonObject(loadedHeader, "Loaded session header"))
+					!isDeepStrictEqual(physicalHeaderWithoutEpoch, loadedHeaderWithoutEpoch)
 				) {
 					throw new Error(`Session header changed during entry replacement: ${sessionFile}`);
 				}
@@ -2453,14 +2560,15 @@ export class SessionManager {
 				const replacementsById = new Map(
 					normalizedChanges.map((change) => [change.expectedEntry.id, change.replacement] as const),
 				);
-				committedEntries = physical.entries.map((entry) =>
-					entry.type === "session" ? entry : (replacementsById.get(entry.id) ?? entry),
-				);
-				if (normalizedChanges.every((change) => isDeepStrictEqual(change.expectedEntry, change.replacement))) {
-					lease.assertOwned();
-					applyManagerState(committedEntries);
-					return true;
+				const nextMutationEpoch = getSessionMutationEpoch(physical.header, sessionFile) + 1;
+				if (!Number.isSafeInteger(nextMutationEpoch)) {
+					throw new Error(`Session mutation epoch is exhausted: ${sessionFile}`);
 				}
+				committedEntries = physical.entries.map((entry) =>
+					entry.type === "session"
+						? { ...entry, mutationEpoch: nextMutationEpoch }
+						: (replacementsById.get(entry.id) ?? entry),
+				);
 
 				lease.heartbeat();
 				temporaryFd = openSync(temporary, "wx", 0o600);
@@ -2486,6 +2594,7 @@ export class SessionManager {
 				lease.assertOwned();
 				renameSync(temporary, sessionFile);
 				committed = true;
+				replacementCommitted = true;
 				let postCommitError: unknown;
 				try {
 					fsyncParentDirectory(sessionFile);
@@ -2500,9 +2609,7 @@ export class SessionManager {
 				applyManagerState(committedEntries);
 				stateApplied = true;
 				if (postCommitError) {
-					throw new Error(`Session replacement committed but post-commit durability failed: ${sessionFile}`, {
-						cause: postCommitError,
-					});
+					throw new SessionEntryReplacementCommittedError(sessionFile, postCommitError);
 				}
 				return true;
 			} catch (error) {
@@ -2527,21 +2634,27 @@ export class SessionManager {
 					stateApplied = true;
 				}
 				if (cleanupError) {
+					if (committed) throw new SessionEntryReplacementCommittedError(sessionFile, cleanupError);
 					throw new Error(`Session replacement failed and temporary cleanup failed: ${temporary}`, {
 						cause: cleanupError,
 					});
 				}
 				if (committed) {
-					throw new Error(`Session replacement committed but reported a post-commit failure: ${sessionFile}`, {
-						cause: error,
-					});
+					if (error instanceof SessionEntryReplacementCommittedError) throw error;
+					throw new SessionEntryReplacementCommittedError(sessionFile, error);
 				}
 				throw error;
-			} finally {
-				if (temporaryFd !== undefined) closeSync(temporaryFd);
-				if (canonicalFd !== undefined) closeSync(canonicalFd);
+				} finally {
+					if (temporaryFd !== undefined) closeSync(temporaryFd);
+					if (canonicalFd !== undefined) closeSync(canonicalFd);
+				}
+			});
+		} catch (error) {
+			if (replacementCommitted && !(error instanceof SessionEntryReplacementCommittedError)) {
+				throw new SessionEntryReplacementCommittedError(sessionFile, error);
 			}
-		});
+			throw error;
+		}
 	}
 
 	/**

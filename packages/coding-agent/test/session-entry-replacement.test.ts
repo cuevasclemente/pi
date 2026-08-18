@@ -18,8 +18,10 @@ import {
 	CURRENT_SESSION_VERSION,
 	MAX_DESTRUCTIVE_TRANSACTION_BYTES,
 	type SessionEntryBase,
+	SessionEntryReplacementCommittedError,
 	type SessionHeader,
 	SessionManager,
+	StaleSessionMutationEpochError,
 } from "../src/core/session-manager.ts";
 
 interface SyntheticEntry extends SessionEntryBase {
@@ -31,6 +33,7 @@ const tempDirs: string[] = [];
 interface ReplacementWorkerResult {
 	result?: boolean;
 	error?: string;
+	code?: string;
 	heartbeatObserved?: boolean;
 	lockIdentityStable?: boolean;
 	tempContainedExpected?: boolean;
@@ -99,7 +102,10 @@ async function createReplacementWorker(data: object): Promise<{
 				}
 				throw new Error("replacement temporary file was not observed");
 			} catch (error) {
-				parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });
+				parentPort.postMessage({
+					error: error instanceof Error ? error.message : String(error),
+					code: typeof error === "object" && error !== null && "code" in error ? String(error.code) : undefined,
+				});
 			}
 		});
 	`;
@@ -128,7 +134,10 @@ async function createReplacementWorker(data: object): Promise<{
 	};
 }
 
-async function createSuccessorLockWorker(file: string): Promise<{
+async function createSuccessorLockWorker(
+	file: string,
+	trigger: "temporary" | "canonicalRename" = "temporary",
+): Promise<{
 	acquire: () => Promise<{ dev: string; ino: string }>;
 	release: () => Promise<{ existsAfterRelease: boolean }>;
 }> {
@@ -142,16 +151,25 @@ async function createSuccessorLockWorker(file: string): Promise<{
 		const require = createRequire(workerData.requireBase);
 		const lockfile = require("proper-lockfile");
 		const wait = new Int32Array(new SharedArrayBuffer(4));
+		const initialFileStats = lstatSync(workerData.file, { bigint: true });
 		let successorRelease;
 		parentPort.postMessage("ready");
 		parentPort.on("message", (message) => {
 			try {
 				if (message === "acquire") {
-					const prefix = basename(workerData.file) + ".rewrite-";
 					const deadline = Date.now() + 10000;
-					while (Date.now() < deadline) {
-						if (readdirSync(dirname(workerData.file)).some((name) => name.startsWith(prefix))) break;
-						Atomics.wait(wait, 0, 0, 1);
+					if (workerData.trigger === "temporary") {
+						const prefix = basename(workerData.file) + ".rewrite-";
+						while (Date.now() < deadline) {
+							if (readdirSync(dirname(workerData.file)).some((name) => name.startsWith(prefix))) break;
+							Atomics.wait(wait, 0, 0, 1);
+						}
+					} else {
+						while (Date.now() < deadline) {
+							const currentFileStats = lstatSync(workerData.file, { bigint: true });
+							if (currentFileStats.dev !== initialFileStats.dev || currentFileStats.ino !== initialFileStats.ino) break;
+							Atomics.wait(wait, 0, 0, 1);
+						}
 					}
 					const lockPath = workerData.file + ".lock";
 					rmdirSync(lockPath);
@@ -175,7 +193,7 @@ async function createSuccessorLockWorker(file: string): Promise<{
 		});
 	`;
 	const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(source)}`), {
-		workerData: { file, requireBase },
+		workerData: { file, requireBase, trigger },
 		execArgv: ["--import", "tsx"],
 		env: { ...process.env, TSX_TSCONFIG_PATH: rootTsconfig },
 	});
@@ -288,7 +306,7 @@ describe("SessionManager.replaceEntryIfCurrent", () => {
 		expect(manager.replaceEntryIfCurrent(payloadReplacement, tombstone)).toBe(true);
 		expect(manager.getLeafId()).toBe("left");
 		expect(manager.getEntry("root")).toEqual(tombstone);
-		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getHeader()).toEqual({ ...header, mutationEpoch: 2 });
 		expect(readFileSync(file, "utf8")).not.toContain("old-secret");
 		expect(readFileSync(file, "utf8")).not.toContain("new-value");
 		expect(readdirSync(join(file, ".."))).toEqual(["session.jsonl"]);
@@ -520,6 +538,91 @@ describe("SessionManager.replaceEntryIfCurrent", () => {
 		20000,
 	);
 
+	it(
+		"reports a typed committed error while keeping manager and canonical state new",
+		async () => {
+			const fixture = createSessionFile();
+			const manager = SessionManager.open(fixture.file);
+			const paddingEntries = Array.from({ length: 16 }, (_, index) => ({
+				type: "synthetic",
+				id: `post-commit-padding-${index}`,
+				parentId: index === 0 ? fixture.right.id : `post-commit-padding-${index - 1}`,
+				timestamp: "2026-01-01T00:00:05.000Z",
+				value: "x".repeat(1024 * 1024),
+			}));
+			writeFileSync(
+				fixture.file,
+				[fixture.header, fixture.root, fixture.left, fixture.right, ...paddingEntries]
+					.map((entry) => `${JSON.stringify(entry)}\n`)
+					.join(""),
+			);
+			const successor = await createSuccessorLockWorker(fixture.file, "canonicalRename");
+			const acquiredSuccessor = successor.acquire();
+			const replacement = { ...fixture.root, value: "committed replacement" };
+			let caught: unknown;
+			try {
+				manager.replaceEntryIfCurrent(fixture.root, replacement);
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(SessionEntryReplacementCommittedError);
+			expect(caught).toMatchObject({ committed: true, code: "ESESSIONREPLACEMENTCOMMITTED" });
+			await acquiredSuccessor;
+			expect(manager.getEntry(fixture.root.id)).toEqual(replacement);
+			expect(manager.getHeader()?.mutationEpoch).toBe(1);
+			expect(await successor.release()).toEqual({ existsAfterRelease: false });
+			const reopened = SessionManager.open(fixture.file);
+			expect(reopened.getEntry(fixture.root.id)).toEqual(replacement);
+			expect(reopened.getHeader()?.mutationEpoch).toBe(1);
+		},
+		20000,
+	);
+
+	it("rejects every append surface from a manager made stale by replacement", () => {
+		const fixture = createSessionFile();
+		const stale = SessionManager.open(fixture.file);
+		const replacer = SessionManager.open(fixture.file);
+		expect(replacer.replaceEntryIfCurrent(fixture.root, { ...fixture.root, value: "replacement" })).toBe(true);
+
+		const staleWrites: Array<() => unknown> = [
+			() => stale.appendMessage({ role: "user", content: "stale", timestamp: Date.now() }),
+			() => stale.appendThinkingLevelChange("high"),
+			() => stale.appendModelChange("synthetic-provider", "synthetic-model"),
+			() => stale.appendCompaction("stale", fixture.root.id, 1),
+			() => stale.appendCustomEntry("synthetic", { stale: true }),
+			() => stale.appendCustomMessageEntry("synthetic", "stale", false),
+			() => stale.appendLabelChange(fixture.left.id, "stale"),
+			() => stale.branchWithSummary(fixture.left.id, "stale"),
+			() => stale.appendSessionInfo("stale name"),
+		];
+		for (const write of staleWrites) expect(write).toThrow(StaleSessionMutationEpochError);
+		expect(stale.getEntry(fixture.root.id)).toEqual(fixture.root);
+		expect(stale.getHeader()?.mutationEpoch).toBeUndefined();
+
+		const reopened = SessionManager.open(fixture.file);
+		expect(reopened.appendCustomEntry("synthetic", { reopened: true })).toEqual(expect.any(String));
+		expect(reopened.appendSessionInfo("reopened name")).toEqual(expect.any(String));
+	});
+
+	it("increments the mutation epoch once per successful multi-replacement from a legacy header", () => {
+		const fixture = createSessionFile();
+		const manager = SessionManager.open(fixture.file);
+		expect(manager.getHeader()?.mutationEpoch).toBeUndefined();
+		const rootReplacement = { ...fixture.root, value: "root replacement" };
+		const leftReplacement = { ...fixture.left, value: "left replacement" };
+		expect(
+			manager.replaceEntriesIfCurrent([
+				{ expectedEntry: fixture.root, replacement: rootReplacement },
+				{ expectedEntry: fixture.left, replacement: leftReplacement },
+			]),
+		).toBe(true);
+		expect(manager.getHeader()?.mutationEpoch).toBe(1);
+		expect(manager.replaceEntryIfCurrent(rootReplacement, { ...rootReplacement, value: "second" })).toBe(true);
+		expect(manager.getHeader()?.mutationEpoch).toBe(2);
+		expect(SessionManager.open(fixture.file).getHeader()?.mutationEpoch).toBe(2);
+	});
+
 	it("rejects invalid UTF-8 and invalid timestamps on the destructive path", () => {
 		const invalidUtf8 = createSessionFile();
 		const validBytes = readFileSync(invalidUtf8.file);
@@ -635,11 +738,21 @@ describe("SessionManager.replaceEntryIfCurrent", () => {
 			});
 			const appender = await createReplacementWorker({ mode: "append", file, name: "racing append" });
 
-			const results = await Promise.all([replacer.run(), appender.run()]);
-			expect(results).toEqual([{ result: true }, { result: true }]);
+			const [replacementResult, appendResult] = await Promise.all([replacer.run(), appender.run()]);
+			expect(replacementResult).toEqual({ result: true });
 			const reopened = SessionManager.open(file);
 			expect(reopened.getEntry(root.id)).toMatchObject({ value: "replacement" });
-			expect(reopened.getSessionName()).toBe("racing append");
+			if (appendResult.result) {
+				expect(appendResult).toEqual({ result: true });
+				expect(reopened.getSessionName()).toBe("racing append");
+			} else {
+				expect(appendResult.code).toBe("ESTALESESSIONMUTATIONEPOCH");
+				expect(reopened.getSessionName()).toBeUndefined();
+				reopened.appendSessionInfo("append after reopen");
+				const afterReopenAppend = SessionManager.open(file);
+				expect(afterReopenAppend.getEntry(root.id)).toMatchObject({ value: "replacement" });
+				expect(afterReopenAppend.getSessionName()).toBe("append after reopen");
+			}
 		},
 		20000,
 	);
